@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # Puppeteer is only needed by the local test harness and pulls a full
+      # Chrome download; CI has no GPU to run it against.
+      - name: Install dependencies
+        run: npm ci --omit=optional
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: 'true'
+
+      - name: Build
+        run: npm run build
+
+      - name: Report bundle size
+        run: du -sh dist && ls -lh dist/assets
+
+  no-external-assets:
+    name: No external assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Everything this project renders is generated at runtime. Binary art
+      # assets in src/ would break that promise silently, so fail loudly.
+      - name: Check src/ contains only code
+        run: |
+          offenders=$(find src -type f \
+            ! -name '*.js' ! -name '*.glsl' ! -name '*.wgsl' ! -name '*.css' \
+            -print)
+          if [ -n "$offenders" ]; then
+            echo "::error::Non-code files found under src/ — this project ships no assets:"
+            echo "$offenders"
+            exit 1
+          fi
+          echo "src/ is clean."

@@ -1,0 +1,54 @@
+{
+  "name": "abyssal-ocean",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "ABYSSAL — a fully procedural cinematic ocean and extreme weather simulation running in the browser (Three.js / WebGL2 / GLSL3). No external assets: every wave, cloud, foam streak and lightning bolt is generated on the GPU at runtime.",
+  "license": "MIT",
+  "author": "Davi (Token-Gremlin) <https://github.com/Token-Gremlin>",
+  "homepage": "https://github.com/Token-Gremlin/natural-disasters#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Token-Gremlin/natural-disasters.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Token-Gremlin/natural-disasters/issues"
+  },
+  "keywords": [
+    "threejs",
+    "webgl2",
+    "glsl",
+    "shaders",
+    "ocean",
+    "fft-ocean",
+    "water-simulation",
+    "volumetric-clouds",
+    "atmospheric-scattering",
+    "raymarching",
+    "procedural-generation",
+    "weather-simulation",
+    "natural-disasters",
+    "tsunami",
+    "hurricane",
+    "post-processing",
+    "taa",
+    "pbr",
+    "real-time-rendering",
+    "cinematic"
+  ],
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview --host",
+    "smoke": "node tools/smoke.mjs"
+  },
+  "dependencies": {
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "puppeteer": "^25.8.0",
+    "vite": "^8.2.2"
+  }
+}

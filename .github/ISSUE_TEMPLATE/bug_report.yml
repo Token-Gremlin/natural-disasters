@@ -1,0 +1,75 @@
+name: Bug report
+description: Something renders wrong, crashes, or performs badly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Visual bugs are hard to describe and easy to show. A screenshot or a
+        short clip is worth more than a paragraph.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What did you see, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      placeholder: |
+        1. Open the demo
+        2. Press SANDBOX
+        3. Press 7 for a tsunami
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshot or capture
+      description: Drag an image or video in here.
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      description: The HUD shows the detected renderer. `chrome://gpu` has the full string.
+      placeholder: NVIDIA GeForce GTX 1650 / ANGLE D3D11
+    validations:
+      required: true
+
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and OS
+      placeholder: Chrome 141 on Windows 11
+    validations:
+      required: true
+
+  - type: dropdown
+    id: preset
+    attributes:
+      label: Quality preset
+      options: [auto-detected, potato, low, medium, high, ultra]
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: It still happens with adaptive quality off (`?adaptive=0`)
+        - label: It still happens after a hard reload with an empty cache
+
+  - type: textarea
+    id: console
+    attributes:
+      label: Console output
+      description: Anything logged to the browser console.
+      render: text

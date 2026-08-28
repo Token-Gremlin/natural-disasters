@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+.vite/
+
+# test harness output — hundreds of megabytes of debug captures, traces and
+# state dumps produced by tools/*.mjs. Regenerate them, never commit them.
+tools/shots/
+tools/*.txt
+
+# editors
+.vscode/
+.idea/
+*.swp
+
+# os
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# logs
+*.log
+npm-debug.log*
+yarn-error.log*
