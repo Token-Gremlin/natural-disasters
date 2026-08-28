@@ -2,10 +2,13 @@
 
 **A fully procedural ocean and extreme weather simulation that runs in a browser tab.**
 
+[![Live demo](https://img.shields.io/badge/▶_Live_demo-token--gremlin.github.io-6fd6ff.svg)](https://token-gremlin.github.io/natural-disasters/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/Token-Gremlin/natural-disasters/actions/workflows/ci.yml/badge.svg)](https://github.com/Token-Gremlin/natural-disasters/actions/workflows/ci.yml)
 [![Three.js](https://img.shields.io/badge/three.js-r169-black.svg)](https://threejs.org)
 [![WebGL2](https://img.shields.io/badge/WebGL2-GLSL3-red.svg)](https://registry.khronos.org/webgl/specs/latest/2.0/)
+
+### ▶ [Run it in your browser](https://token-gremlin.github.io/natural-disasters/)
 
 ![Clear sky over open ocean with a sun glitter path](docs/media/clear-sky.png)
 
@@ -99,7 +102,9 @@ film grain and vignette. Quality adapts at runtime to hold a frame budget.
 
 ## Quick start
 
-Requires [Node.js](https://nodejs.org) 20.19+ or 22.12+.
+The fastest way in is the [live build](https://token-gremlin.github.io/natural-disasters/) —
+it is the same bundle, deployed straight from `main`. To run it locally you need
+[Node.js](https://nodejs.org) 20.19+ or 22.12+.
 
 ```bash
 git clone https://github.com/Token-Gremlin/natural-disasters.git
