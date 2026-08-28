@@ -42,6 +42,7 @@
     "dev": "vite --host",
     "build": "vite build",
     "preview": "vite preview --host",
+    "test": "node tools/quality-sim.mjs",
     "smoke": "node tools/smoke.mjs"
   },
   "dependencies": {

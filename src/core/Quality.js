@@ -36,6 +36,21 @@ export const PRESETS = {
   },
 };
 
+export const TIERS = ['ultra', 'high', 'medium', 'low', 'potato'];
+
+// Enough frames that one slow one does not decide policy...
+const SAMPLE_FRAMES = 24;
+// ...but never wait longer than this for them. At 60 fps the frame count is
+// reached first (24 frames is about 400 ms) so this changes nothing; below
+// that it closes the window early, which is the entire point of having it.
+const SAMPLE_MS = 400;
+// Still take a handful, so a single shader compile cannot pass as a sample.
+const MIN_FRAMES = 4;
+
+const MIN_SCALE = 0.5;
+// Over budget by this much and the incremental path cannot arrive in time.
+const PANIC = 4.0;
+
 export class Quality {
   constructor(name = 'high') {
     this.setPreset(name);
@@ -45,19 +60,65 @@ export class Quality {
     this._acc = 0;
     this._count = 0;
     this._cooldown = 0;
+    this._window = new Float32Array(SAMPLE_FRAMES);
+    this._scratch = new Float32Array(SAMPLE_FRAMES);
     this.history = new Float32Array(90);
     this.historyIndex = 0;
     this.onDowngrade = null;
   }
 
-  setPreset(name) {
+  setPreset(name, scale = 1.0) {
     this.presetName = PRESETS[name] ? name : 'high';
     Object.assign(this, PRESETS[this.presetName]);
-    this.dynamicScale = 1.0;
+    this.dynamicScale = scale;
     this._cooldown = 2.0;
   }
 
   get effectiveScale() { return this.renderScale * this.dynamicScale; }
+
+  /** Name of the preset n tiers cheaper, clamped to the bottom. Null if there. */
+  tierBelow(n) {
+    const i = TIERS.indexOf(this.presetName);
+    if (i < 0) return null;
+    const j = Math.min(i + n, TIERS.length - 1);
+    return j > i ? TIERS[j] : null;
+  }
+
+  /** Middle frame time of the closed window; unlike the mean, outlier-proof. */
+  _median(n) {
+    const s = this._scratch.subarray(0, n);
+    s.set(this._window.subarray(0, n));
+    s.sort();
+    return (n & 1) ? s[(n - 1) >> 1] : (s[n / 2 - 1] + s[n / 2]) * 0.5;
+  }
+
+  /**
+   * Shed load in one move instead of in 9% increments. The incremental path
+   * assumes there are frames to spare for the next measurement, but at four
+   * times over budget each measurement costs another half second of locked
+   * tab, so nibbling never arrives in time to be the thing that rescued
+   * anyone. Take the resolution to the floor and skip as many tiers as the
+   * overshoot implies.
+   */
+  _shed(ms) {
+    // A tier is worth roughly a halving of cost, so the overshoot measured in
+    // octaves is the number of tiers worth skipping.
+    const tier = this.tierBelow(Math.max(1, Math.round(Math.log2(ms / this.targetMs))));
+    if (tier && this.onDowngrade) {
+      // Hand the floor scale down with it, so the rebuild allocates the small
+      // targets directly rather than building full-size ones and discarding
+      // them on the very next line.
+      this.onDowngrade(tier, MIN_SCALE);
+      this._cooldown = 3.0;
+      return true;
+    }
+
+    // Already on the bottom tier; resolution is the only knob left.
+    const prev = this.dynamicScale;
+    this.dynamicScale = MIN_SCALE;
+    this._cooldown = 2.0;
+    return Math.abs(prev - this.dynamicScale) > 1e-4;
+  }
 
   /**
    * Closed loop on frame time. Resolution moves first; if we bottom out and
@@ -68,26 +129,40 @@ export class Quality {
     this.historyIndex++;
     if (!this.adaptive) return false;
 
-    this._acc += dtMs; this._count++;
+    if (this._count < SAMPLE_FRAMES) this._window[this._count] = dtMs;
+    this._acc += dtMs;
+    this._count++;
     this._cooldown -= dtMs / 1000;
-    if (this._count < 24) return false;
 
-    const avg = this._acc / this._count;
-    this._acc = 0; this._count = 0;
+    // Close the window on frames or on wall time, whichever comes first.
+    // Waiting on a fixed frame count is harmless at 60 fps and ruinous at 2:
+    // the same twenty-four frames are 400 ms in one case and twelve seconds in
+    // the other, and twelve seconds of frozen tab is the exact situation this
+    // loop exists to escape.
+    if (this._count < MIN_FRAMES) return false;
+    if (this._count < SAMPLE_FRAMES && this._acc < SAMPLE_MS) return false;
+
+    const n = this._count;
+    const avg = this._acc / n;
+    const med = this._median(n);
+    this._acc = 0;
+    this._count = 0;
     if (this._cooldown > 0) return false;
+
+    // Panic decides on the median. A single two-second shader compile drags
+    // the mean past any threshold, and discarding three quality tiers over one
+    // hitch is worse than the hitch was.
+    if (med > this.targetMs * PANIC) return this._shed(med);
 
     const prev = this.dynamicScale;
     if (avg > this.targetMs * 1.25) {
-      if (this.dynamicScale <= 0.56 && this.onDowngrade) {
-        const order = ['ultra', 'high', 'medium', 'low', 'potato'];
-        const i = order.indexOf(this.presetName);
-        if (i >= 0 && i < order.length - 1) {
-          this.onDowngrade(order[i + 1]);
-          this._cooldown = 4.0;
-          return true;
-        }
+      const tier = this.tierBelow(1);
+      if (this.dynamicScale <= MIN_SCALE + 0.06 && tier && this.onDowngrade) {
+        this.onDowngrade(tier, 1.0);
+        this._cooldown = 4.0;
+        return true;
       }
-      this.dynamicScale = Math.max(0.5, this.dynamicScale - 0.09);
+      this.dynamicScale = Math.max(MIN_SCALE, this.dynamicScale - 0.09);
       this._cooldown = 0.9;
     } else if (avg < this.targetMs * 0.68) {
       this.dynamicScale = Math.min(1.0, this.dynamicScale + 0.045);

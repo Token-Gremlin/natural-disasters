@@ -36,6 +36,12 @@ jobs:
         env:
           PUPPETEER_SKIP_DOWNLOAD: 'true'
 
+      # Pure logic, no GPU needed: proves the adaptive quality loop still
+      # rescues a frame rate it cannot sustain, and still leaves a healthy one
+      # alone.
+      - name: Test
+        run: npm test
+
       - name: Build
         run: npm run build
 

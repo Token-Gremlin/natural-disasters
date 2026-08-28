@@ -165,10 +165,7 @@ export function installUI(app) {
   qRow.className = 'btnrow';
   Object.keys(PRESETS).forEach((k) => {
     const b = button(PRESETS[k].label, (btn) => {
-      app.quality.setPreset(k);
-      app.oceanMesh.setResolution(app.quality.oceanGridX, app.quality.oceanGridY);
-      app._resize(true);
-      app.clouds?.setQuality(app.quality);
+      app.setQualityPreset(k);
       qRow.querySelectorAll('button').forEach(x => x.classList.remove('active'));
       btn.classList.add('active');
     });

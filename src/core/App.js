@@ -65,16 +65,7 @@ export class App {
     this.profiler.enabled = params.get('profile') === '1';
     this.quality = new Quality(params.get('preset') || autoDetectPreset(this.caps.renderer));
     if (params.get('adaptive') === '0') this.quality.adaptive = false;
-    this.quality.onDowngrade = (name) => {
-      this.quality.setPreset(name);
-      this.oceanMesh?.setResolution(this.quality.oceanGridX, this.quality.oceanGridY);
-      this.clouds?.setQuality(this.quality);
-      this.rain?.setQuality(this.quality);
-      this.spray?.setQuality(this.quality);
-      this.waterspout?.setQuality(this.quality);
-      this._resize(true);
-      this.onQualityChange?.(name);
-    };
+    this.quality.onDowngrade = (name, scale) => this.setQualityPreset(name, scale);
 
     this.onProgress('baking procedural textures', 0.08);
     this.textures = await bakeProceduralTextures(renderer, (m) => this.onProgress(m, 0.1));
@@ -133,6 +124,24 @@ export class App {
     renderer.compile(this.scene, this.camera);
 
     this.onProgress('ready', 1.0);
+  }
+
+  /**
+   * The one way a preset changes, whether the adaptive loop asked or the user
+   * clicked. Every subsystem that caches something derived from the preset has
+   * to be told, and the HUD used to carry its own copy of this list that had
+   * already drifted — rain, spray and the waterspout kept their old step counts
+   * when a preset was picked by hand.
+   */
+  setQualityPreset(name, scale = 1.0) {
+    this.quality.setPreset(name, scale);
+    this.oceanMesh?.setResolution(this.quality.oceanGridX, this.quality.oceanGridY);
+    this.clouds?.setQuality(this.quality);
+    this.rain?.setQuality(this.quality);
+    this.spray?.setQuality(this.quality);
+    this.waterspout?.setQuality(this.quality);
+    this._resize(true);
+    this.onQualityChange?.(this.quality.presetName);
   }
 
   _resize(force = false) {

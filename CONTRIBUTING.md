@@ -69,9 +69,12 @@ node tools/sb.mjs --tag after  --look sky,sea,high --nohud
 node tools/diff.mjs tools/shots/before-sea.png tools/shots/after-sea.png
 ```
 
+`npm test` runs the pure-logic checks — currently the adaptive quality loop,
+which is easy to break in ways that only show up on hardware slower than yours.
+CI runs it too.
+
 `node tools/smoke.mjs` boots the app and fails on any console error or shader
-compile problem. CI runs the build, but it cannot run the GPU, so this check is
-on you.
+compile problem. CI cannot run the GPU, so that one is on you.
 
 ## Pull requests
 
