@@ -26,7 +26,8 @@ jobs:
           node-version: 22
           cache: npm
 
-      - run: npm ci --omit=optional
+      # Optional deps carry Rolldown's native binding; do not omit them.
+      - run: npm ci
         env:
           PUPPETEER_SKIP_DOWNLOAD: 'true'
 

@@ -28,9 +28,11 @@ jobs:
           cache: npm
 
       # Puppeteer is only needed by the local test harness and pulls a full
-      # Chrome download; CI has no GPU to run it against.
+      # Chrome download; CI has no GPU to run it against. Optional deps must
+      # stay in — Rolldown ships its native binding as one, and omitting them
+      # leaves the build with no backend.
       - name: Install dependencies
-        run: npm ci --omit=optional
+        run: npm ci
         env:
           PUPPETEER_SKIP_DOWNLOAD: 'true'
 
