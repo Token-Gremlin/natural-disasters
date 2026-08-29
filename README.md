@@ -364,3 +364,16 @@ The techniques here are built on published work:
 - Troy Sobotka, *AgX* — the display transform.
 
 Built with [Three.js](https://threejs.org) and [Vite](https://vitejs.dev).
+
+---
+
+## Community support
+
+A community-created token was independently launched on Pump.fun after ABYSSAL was open-sourced.
+
+I did not create or fund the token. Its creator configured 100% of the creator-fee share to my GitHub account as a way to support continued open-source development.
+
+Contract address (Solana):
+`3v3MymJvAoH2P4kb3uc2XqDX5LSK3ZyR1E3DuqSkpump`
+
+Participation is entirely optional. This is not an official investment product, and nothing here should be interpreted as financial advice or a promise regarding the token's value.
