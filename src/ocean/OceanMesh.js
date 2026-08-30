@@ -5,6 +5,7 @@ import { NOISE_GLSL } from '../gfx/NoiseGLSL.js';
 import { ATMO_COMMON } from '../sky/AtmosphereGLSL.js';
 import { AERIAL_GLSL } from '../sky/Atmosphere.js';
 import { SHADING_GLSL } from '../gfx/ShadingGLSL.js';
+import { WEATHER_GLSL } from '../sky/Clouds.js';
 
 /**
  * Screen-space projected grid. Every vertex is a view ray intersected with the
@@ -378,14 +379,9 @@ uniform vec3 uSunColor;
 uniform float uSunIntensity;
 uniform vec3 uAmbientColor;
 uniform sampler2D uTransmittanceLUT;
-uniform sampler2D uWeatherMap;
-uniform float uWeatherScaleM;
-uniform float uCoverage;
-uniform float uCloudContrast;
 uniform float uCloudDensity;
 uniform float uCloudBottom;
-uniform vec2 uCloudWind;
-uniform float uCloudTime;
+${WEATHER_GLSL}
 uniform sampler2D uEnvMap;
 uniform float uEnvMaxLod;
 uniform float uEnvWidth;
@@ -445,16 +441,9 @@ float cloudShadow(vec3 p, vec3 L) {
   float up = max(L.y, 0.22);
   vec2 xz = p.xz + L.xz / up * max(uCloudBottom - p.y, 0.0);
 
-  vec2 w = xz + uCloudWind * uCloudTime * 0.6;
-  vec4 m = textureLod(uWeatherMap, w / uWeatherScaleM, 0.0);
-  vec4 n = textureLod(uWeatherMap, w / (uWeatherScaleM * 0.27)
-                 + vec2(0.37, 0.11) - uCloudWind * uCloudTime * 0.00002, 0.0);
-  float field = m.r * 0.62 + m.g * 0.22 + n.g * 0.16;
-  float cov = clamp((field - 0.5) * uCloudContrast + uCoverage, 0.0, 1.0);
-
-  // Thin edges of a cell shadow far less than its core, and a slanted beam
-  // takes a longer path through the same deck.
-  float od = smoothstep(0.04, 0.62, cov) * uCloudDensity * 4.2 / up;
+  float cov = weatherAt(xz).x;
+  // A slanted beam takes a longer path through the same deck.
+  float od = cov * uCloudDensity * 3.2 / up;
   return exp(-od);
 }
 
@@ -823,9 +812,11 @@ export class OceanMesh {
     // shadows on the water are always the clouds that are actually up there.
     const cs = cloudShared;
     uniforms.uWeatherMap = cs?.uWeatherMap ?? { value: null };
-    uniforms.uWeatherScaleM = cs?.uWeatherScaleM ?? { value: 58000 };
+    uniforms.uWeatherScaleM = cs?.uWeatherScaleM ?? { value: 56000 };
     uniforms.uCoverage = cs?.uCoverage ?? { value: 0 };
-    uniforms.uCloudContrast = cs?.uCloudContrast ?? { value: 1.6 };
+    uniforms.uWeatherLo = cs?.uWeatherLo ?? { value: new THREE.Vector4(0, 0, 0, 0) };
+    uniforms.uWeatherHi = cs?.uWeatherHi ?? { value: new THREE.Vector4(1, 1, 1, 1) };
+    uniforms.uAnvil = cs?.uAnvil ?? { value: 0 };
     uniforms.uCloudDensity = cs?.uCloudDensity ?? { value: 0.6 };
     uniforms.uCloudBottom = cs?.uCloudBottom ?? { value: 1200 };
     uniforms.uCloudWind = cs?.uCloudWind ?? { value: new THREE.Vector2() };

@@ -26,6 +26,7 @@ export class App {
     this.paused = false;
     this._lastT = 0;
     this._projNoJitter = new THREE.Matrix4();
+    this._invViewProjNJ = new THREE.Matrix4();
   }
 
   async init() {
@@ -101,6 +102,7 @@ export class App {
     this.scene = new THREE.Scene();
     this.scene.add(this.sky.mesh);
     this.scene.add(this.oceanMesh.mesh);
+    this.scene.add(this.clouds.overMesh);
     this.scene.add(this.waterspout.mesh);
     this.scene.add(this.spray.mesh);
     this.scene.add(this.rain.mesh);
@@ -135,6 +137,11 @@ export class App {
    */
   setQualityPreset(name, scale = 1.0) {
     this.quality.setPreset(name, scale);
+    if (this.ocean && this.ocean.N !== this.quality.fftSize) {
+      // The spectra are rebuilt on the next update; the mesh, spray and clouds
+      // keep their materials because resize repoints the bound textures.
+      this.ocean.resize(this.quality.fftSize);
+    }
     this.oceanMesh?.setResolution(this.quality.oceanGridX, this.quality.oceanGridY);
     this.clouds?.setQuality(this.quality);
     this.rain?.setQuality(this.quality);
@@ -201,7 +208,13 @@ export class App {
     this.ocean.update(scaled);
     prof.end('oceanFFT');
     prof.begin('atmoLUT');
-    this.atmosphere.update(this.camera, this.camera.position);
+    // The aerial-perspective LUT is sampled by the clouds and the sea through
+    // the unjittered matrices, so it has to be built with the same ones. The
+    // projection is clean here: the jitter is only added further down.
+    this.camera.updateProjectionMatrix();
+    this.camera.updateMatrixWorld();
+    this._invViewProjNJ.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse).invert();
+    this.atmosphere.update(this.camera, this.camera.position, this._invViewProjNJ);
     prof.end('atmoLUT');
     this.atmosphere.syncUniforms(U);
     U.uAmbientColor.value.set(this.atmosphere.ambientColor.r, this.atmosphere.ambientColor.g, this.atmosphere.ambientColor.b);
@@ -325,7 +338,6 @@ export class App {
     if (this.post) {
       this.post.settings.dof = mode ? false : this.quality.dof;
       this.post.settings.bloom = mode ? false : true;
-      this.post.settings.exposureBias = mode ? 1 : 1;
       this.post.settings.debugPassthrough = mode > 0;
     }
   }

@@ -292,7 +292,7 @@ export class Director {
   }
 
   spawnWaterspout(x, z, strength = 30) {
-    this._vortices.push({ x, z, radius: 34, strength, life: 0, maxLife: 34, ramp: 3 });
+    this._vortices.push({ x, z, radius: 34, strength, life: 0, maxLife: 34, ramp: 3, spout: true });
     this.app.waterspout?.spawn(x, z, strength);
   }
 
@@ -468,6 +468,8 @@ export class Director {
       const w = this.weather.state;
       v.x += Math.cos(w.windAngle) * w.windSpeed * 0.16 * dt;
       v.z += Math.sin(w.windAngle) * w.windSpeed * 0.16 * dt;
+      // the funnel hangs over its vortex; the director owns the position
+      if (v.spout) this.app.waterspout?.setPosition(v.x, v.z);
     }
     for (let i = 0; i < 4; i++) {
       const v = this._vortices[i];

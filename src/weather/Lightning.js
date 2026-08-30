@@ -14,6 +14,8 @@ import { U } from '../core/SharedUniforms.js';
  */
 
 const MAX_SEGMENTS = 2048;
+// one per uBoltState slot in the shader
+const MAX_BOLTS = 4;
 
 const VERT = /* glsl */ `
 precision highp float;
@@ -146,11 +148,11 @@ export class Lightning {
   }
 
   strike(x, z, top) {
-    if (this.bolts.length >= 3) this.bolts.shift();
+    if (this.bolts.length >= MAX_BOLTS) this.bolts.shift();
     const segments = [];
     const start = new THREE.Vector3(x, top, z);
     const end = new THREE.Vector3(
-      x + (Math.random() - 0.5) * top * 0.5, 0,
+      x + (Math.random() - 0.5) * top * 0.5, U.uSeaLevel.value,
       z + (Math.random() - 0.5) * top * 0.5,
     );
     this._grow(segments, start, end, top * 0.42, 0, 1.0);

@@ -108,19 +108,20 @@ ${SHADING_GLSL}
 uniform sampler2D uSrc;
 uniform vec2 uInvSrc;
 uniform float uFirst;
-uniform float uOffset;
 in vec2 vUv;
 layout(location = 0) out vec4 oColor;
+// Each level is a 4x reduction, so a 4x4 box centred on the destination texel
+// covers exactly the source block it stands for: every texel is read once.
 void main(){
   vec4 acc = vec4(0.0);
-  for (int y = 0; y < 2; y++)
-  for (int x = 0; x < 2; x++) {
-    vec2 uv = vUv + (vec2(float(x), float(y)) - 0.5) * uInvSrc * uOffset;
+  for (int y = 0; y < 4; y++)
+  for (int x = 0; x < 4; x++) {
+    vec2 uv = vUv + (vec2(float(x), float(y)) - 1.5) * uInvSrc;
     vec4 s = texture(uSrc, uv);
     if (uFirst > 0.5) acc += vec4(log(clamp(luminance(s.rgb), 3e-4, 6.0e4)));
     else acc += s;
   }
-  oColor = acc * 0.25;
+  oColor = acc * (1.0 / 16.0);
 }
 `;
 
@@ -155,10 +156,12 @@ void main(){
 const BLOOM_DOWN_FRAG = /* glsl */ `
 ${SHADING_GLSL}
 uniform sampler2D uSrc;
+uniform sampler2D uExposure;
 uniform vec2 uInvSrc;
 uniform float uFirstMip;
 uniform float uThreshold;
 uniform float uSoftKnee;
+uniform float uExposureBias;
 in vec2 vUv;
 layout(location = 0) out vec4 oColor;
 
@@ -191,7 +194,11 @@ void main(){
     float w0 = karisWeight(g0), w1 = karisWeight(g1), w2 = karisWeight(g2), w3 = karisWeight(g3), w4 = karisWeight(g4);
     float wsum = w0 * 0.125 + w1 * 0.125 + w2 * 0.125 + w3 * 0.125 + w4 * 0.5;
     result = (g0 * w0 * 0.125 + g1 * w1 * 0.125 + g2 * w2 * 0.125 + g3 * w3 * 0.125 + g4 * w4 * 0.5) / max(wsum, 1e-5);
-    float lum = luminance(result);
+    // Threshold in exposed space: the scene is HDR radiance spanning many
+    // stops, so an absolute cut either blooms everything at noon or nothing at
+    // dusk. What counts as a highlight is what will land bright on screen.
+    float exposure = texture(uExposure, vec2(0.5)).r * uExposureBias;
+    float lum = luminance(result) * exposure;
     float knee = uThreshold * uSoftKnee + 1e-5;
     float soft = clamp(lum - uThreshold + knee, 0.0, 2.0 * knee);
     soft = soft * soft / (4.0 * knee);
@@ -393,6 +400,9 @@ uniform float uDebugPass;
 in vec2 vUv;
 layout(location = 0) out vec4 oColor;
 
+// Grain and dither are applied by the final pass, after sharpening: CAS on
+// top of noise just sharpens the noise.
+
 vec3 sampleChromatic(vec2 uv, float amount) {
   vec2 c = uv - 0.5;
   float r2 = dot(c, c);
@@ -455,12 +465,25 @@ void main(){
   mapped *= clamp(v, 0.0, 1.0);
 
   vec3 srgb = linearToSrgb(max(mapped, vec3(0.0)));
+  oColor = vec4(clamp(srgb, 0.0, 1.0), 1.0);
+}
+`;
 
-  // ---- film grain (luma-dependent) + 8-bit dither
+/* ============================================================ grain + dither */
+const GRAIN_FRAG = /* glsl */ `
+${SHADING_GLSL}
+${NOISE_GLSL}
+uniform sampler2D uSrc;
+uniform float uFrame;
+uniform float uGrain;
+in vec2 vUv;
+layout(location = 0) out vec4 oColor;
+void main(){
+  vec3 srgb = texture(uSrc, vUv).rgb;
+  // film grain (luma-dependent) + 8-bit dither, always the last thing applied
   float g = ignTemporal(gl_FragCoord.xy, uFrame) - 0.5;
   srgb += g * uGrain * mix(1.0, 0.3, luminance(srgb));
   srgb += (hash12(gl_FragCoord.xy + uFrame) - 0.5) / 255.0;
-
   oColor = vec4(clamp(srgb, 0.0, 1.0), 1.0);
 }
 `;
@@ -551,10 +574,11 @@ export class PostFX {
     this.dofW = Math.max(2, w >> 1); this.dofH = Math.max(2, h >> 1);
     this.dofRT = makeRT(this.dofW, this.dofH, { ...half, name: 'dof' });
     this.ldrRT = makeRT(w, h, { type: THREE.UnsignedByteType, name: 'ldr' });
+    this.ldrRT2 = makeRT(w, h, { type: THREE.UnsignedByteType, name: 'ldr2' });
 
     // luminance reduction chain (float so it can be read back for diagnostics)
     this.lumChain = [];
-    let lw = Math.max(1, Math.floor(w / 8)), lh = Math.max(1, Math.floor(h / 8));
+    let lw = Math.max(1, Math.round(w / 4)), lh = Math.max(1, Math.round(h / 4));
     while (true) {
       this.lumChain.push(makeRT(lw, lh, {
         type: THREE.FloatType, minFilter: THREE.LinearFilter, name: `lum${lw}`,
@@ -585,7 +609,7 @@ export class PostFX {
         }, { name: 'taa' }),
         lumDown: new FullScreenPass(LUM_DOWN_FRAG, {
           uSrc: { value: null }, uInvSrc: { value: new THREE.Vector2() },
-          uFirst: { value: 0 }, uOffset: { value: 1 },
+          uFirst: { value: 0 },
         }, { name: 'lumDown' }),
         exposure: new FullScreenPass(EXPOSURE_FRAG, {
           uLum: { value: null }, uPrev: { value: null }, uDt: { value: 0.016 },
@@ -593,8 +617,9 @@ export class PostFX {
           uMinEV: { value: -5.0 }, uMaxEV: { value: 17.0 }, uReset: { value: 1 },
         }, { name: 'exposure' }),
         bloomDown: new FullScreenPass(BLOOM_DOWN_FRAG, {
-          uSrc: { value: null }, uInvSrc: { value: new THREE.Vector2() },
+          uSrc: { value: null }, uExposure: { value: null }, uInvSrc: { value: new THREE.Vector2() },
           uFirstMip: { value: 0 }, uThreshold: { value: 1.0 }, uSoftKnee: { value: 0.6 },
+          uExposureBias: { value: 1.0 },
         }, { name: 'bloomDown' }),
         bloomUp: new FullScreenPass(BLOOM_UP_FRAG, {
           uSrc: { value: null }, uBase: { value: null },
@@ -631,6 +656,9 @@ export class PostFX {
         cas: new FullScreenPass(CAS_FRAG, {
           uSrc: { value: null }, uInvResolution: { value: new THREE.Vector2() }, uSharpness: { value: 0.5 },
         }, { name: 'cas' }),
+        grain: new FullScreenPass(GRAIN_FRAG, {
+          uSrc: { value: null }, uFrame: { value: 0 }, uGrain: { value: 0.02 },
+        }, { name: 'grain' }),
       };
     }
     this.reset = true;
@@ -639,7 +667,7 @@ export class PostFX {
   setSize(w, h) {
     if (w === this.width && h === this.height) return;
     this.width = w; this.height = h;
-    [this.sceneResolved, this.tmpA, this.tmpB, this.cocRT, this.dofRT, this.ldrRT].forEach(rt => rt && rt.dispose());
+    [this.sceneResolved, this.tmpA, this.tmpB, this.cocRT, this.dofRT, this.ldrRT, this.ldrRT2].forEach(rt => rt && rt.dispose());
     this.taaHistory.dispose();
     this.lumChain.forEach(rt => rt.dispose());
     this.bloomChain.forEach(rt => rt.dispose());
@@ -676,12 +704,12 @@ export class PostFX {
     }
 
     // ------------------------------------------------------------ exposure
-    p.lumDown.set('uSrc', color).set('uFirst', 1).set('uOffset', 4.0);
+    p.lumDown.set('uSrc', color).set('uFirst', 1);
     p.lumDown.uniforms.uInvSrc.value.set(inv[0], inv[1]);
     p.lumDown.render(r, this.lumChain[0]);
     for (let i = 1; i < this.lumChain.length; i++) {
       const src = this.lumChain[i - 1];
-      p.lumDown.set('uSrc', src.texture).set('uFirst', 0).set('uOffset', 2.0);
+      p.lumDown.set('uSrc', src.texture).set('uFirst', 0);
       p.lumDown.uniforms.uInvSrc.value.set(1 / src.width, 1 / src.height);
       p.lumDown.render(r, this.lumChain[i]);
     }
@@ -726,7 +754,8 @@ export class PostFX {
         const srcW = i === 0 ? w : this.bloomChain[i - 1].width;
         const srcH = i === 0 ? h : this.bloomChain[i - 1].height;
         p.bloomDown.set('uSrc', src).set('uFirstMip', i === 0 ? 1 : 0)
-          .set('uThreshold', s.bloomThreshold);
+          .set('uThreshold', s.bloomThreshold)
+          .set('uExposure', this.exposureRT.read.texture).set('uExposureBias', s.exposureBias);
         p.bloomDown.uniforms.uInvSrc.value.set(1 / srcW, 1 / srcH);
         p.bloomDown.render(r, this.bloomChain[i]);
       }
@@ -759,13 +788,26 @@ export class PostFX {
     c.uniforms.uResolution.value.set(w, h);
     c.uniforms.uFlashColor.value.copy(this.flashColor);
 
-    if (s.sharpen > 0.001) {
-      c.render(r, this.ldrRT);
-      p.cas.set('uSrc', this.ldrRT.texture).set('uSharpness', s.sharpen);
-      p.cas.uniforms.uInvResolution.value.set(inv[0], inv[1]);
-      p.cas.render(r, outTarget);
-    } else {
+    // Order matters at the tail: tonemap -> sharpen -> grain + dither. Grain
+    // before CAS gets sharpened into a speckle; dither before CAS is undone.
+    const passthrough = !!s.debugPassthrough;
+    const wantGrain = !passthrough && s.grain > 0.0001;
+    const wantCas = !passthrough && s.sharpen > 0.001;
+    if (!wantCas && !wantGrain) {
       c.render(r, outTarget);
+    } else {
+      c.render(r, this.ldrRT);
+      let ldr = this.ldrRT;
+      if (wantCas) {
+        p.cas.set('uSrc', ldr.texture).set('uSharpness', s.sharpen);
+        p.cas.uniforms.uInvResolution.value.set(inv[0], inv[1]);
+        p.cas.render(r, wantGrain ? this.ldrRT2 : outTarget);
+        ldr = this.ldrRT2;
+      }
+      if (wantGrain) {
+        p.grain.set('uSrc', ldr.texture).set('uFrame', this.frame).set('uGrain', s.grain);
+        p.grain.render(r, outTarget);
+      }
     }
 
     this.reset = false;

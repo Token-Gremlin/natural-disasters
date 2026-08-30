@@ -196,11 +196,10 @@ export class Rain {
     geom.setAttribute('position', new THREE.BufferAttribute(quad, 3));
     geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
 
-    this.max = quality.rainCount ?? 24000;
-    const idx = new Float32Array(this.max);
-    for (let i = 0; i < this.max; i++) idx[i] = i;
-    geom.setAttribute('aIndex', new THREE.InstancedBufferAttribute(idx, 1));
+    this.max = 0;
     geom.instanceCount = 0;
+    this.geom = geom;
+    this._setCapacity(quality.rainCount ?? 24000);
     geom.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e6);
 
     this.material = new THREE.RawShaderMaterial({
@@ -243,11 +242,24 @@ export class Rain {
     this.mesh = new THREE.Mesh(geom, this.material);
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = 6;
-    this.geom = geom;
+  }
+
+  /** Size the slot buffer; grows as well as shrinks so a preset can recover. */
+  _setCapacity(n) {
+    n = Math.max(1, n | 0);
+    if (n === this.max) return;
+    this.max = n;
+    const idx = new Float32Array(n);
+    for (let i = 0; i < n; i++) idx[i] = i;
+    const old = this.geom.getAttribute('aIndex');
+    if (old) this.geom.deleteAttribute('aIndex');
+    this.geom.setAttribute('aIndex', new THREE.InstancedBufferAttribute(idx, 1));
+    this.geom.instanceCount = Math.min(this.geom.instanceCount, n);
+    if (this.material) this.material.uniforms.uCount.value = n;
   }
 
   setQuality(q) {
-    this.max = Math.min(this.max, q.rainCount ?? this.max);
+    this._setCapacity(q.rainCount ?? this.max);
     this.budget = q.rainCount ?? this.max;
   }
 

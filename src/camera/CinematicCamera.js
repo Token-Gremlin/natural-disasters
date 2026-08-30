@@ -1,9 +1,15 @@
 import * as THREE from 'three';
 
 const _v = new THREE.Vector3();
+const _v2 = new THREE.Vector3();
+const _fwd = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _mv = new THREE.Vector3();
 const _q = new THREE.Quaternion();
+const _qRoll = new THREE.Quaternion();
 const _m = new THREE.Matrix4();
 const UP = new THREE.Vector3(0, 1, 0);
+const Z_AXIS = new THREE.Vector3(0, 0, 1);
 
 function smoothNoise(t, seed) {
   const s = Math.sin(t * 1.13 + seed * 12.9898) * 0.5
@@ -353,11 +359,10 @@ export class CinematicCamera {
       const speed = this.freeSpeed * sprint * crawl * THREE.MathUtils.clamp(zoomK, 0.12, 1.6);
 
       const cp = Math.cos(this.pitch);
-      const fwd = _v.set(-Math.sin(this.yaw) * cp, Math.sin(this.pitch), -Math.cos(this.yaw) * cp);
-      const fwdCopy = fwd.clone();
-      const right = new THREE.Vector3().crossVectors(fwdCopy, UP).normalize();
+      const fwdCopy = _fwd.set(-Math.sin(this.yaw) * cp, Math.sin(this.pitch), -Math.cos(this.yaw) * cp);
+      const right = _right.crossVectors(fwdCopy, UP).normalize();
 
-      const mv = new THREE.Vector3();
+      const mv = _mv.set(0, 0, 0);
       if (k.has('KeyW') || k.has('ArrowUp')) mv.add(fwdCopy);
       if (k.has('KeyS') || k.has('ArrowDown')) mv.sub(fwdCopy);
       if (k.has('KeyD') || k.has('ArrowRight')) mv.add(right);
@@ -472,10 +477,10 @@ export class CinematicCamera {
       if (cam.position.y < minY) cam.position.y = minY;
     }
 
-    _m.lookAt(cam.position, _v.copy(this._smoothLook).add(_v.clone().set(rx * 40, ry * 40, 0)), UP);
+    _m.lookAt(cam.position, _v.copy(this._smoothLook).add(_v2.set(rx * 40, ry * 40, 0)), UP);
     _q.setFromRotationMatrix(_m);
     this.roll += (this.rollTarget + smoothNoise(time * 0.6, 6.0) * amp * 0.004 - this.roll) * Math.min(1, dt * 2);
-    _q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), this.roll));
+    _q.multiply(_qRoll.setFromAxisAngle(Z_AXIS, this.roll));
     cam.quaternion.copy(_q);
 
     // auto focus on the look target

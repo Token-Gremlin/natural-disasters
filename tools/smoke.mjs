@@ -29,7 +29,7 @@ const gpuArgs = [
   '--ignore-gpu-blocklist',
   '--enable-gpu-rasterization',
   '--enable-zero-copy',
-  '--use-angle=d3d11',
+  process.platform === 'win32' ? '--use-angle=d3d11' : '--use-angle=metal',
   '--enable-unsafe-webgpu',
   // Without these the frame time snaps to multiples of the refresh interval and
   // every measurement reads as a wild over-estimate of the real cost.

@@ -51,6 +51,15 @@ const MIN_SCALE = 0.5;
 // Over budget by this much and the incremental path cannot arrive in time.
 const PANIC = 4.0;
 
+// Recovery is deliberately slow and conservative: the median has to sit under
+// this fraction of the budget, at full resolution, for this long before one
+// tier is handed back, and then the loop waits this long again before it will
+// consider another step. Each time a step up gets undone the required quiet
+// window doubles, so a machine on the edge does not oscillate between tiers.
+const RECOVER_RATIO = 0.6;
+const RECOVER_WINDOW_S = 10.0;
+const RECOVER_COOLDOWN_S = 20.0;
+
 export class Quality {
   constructor(name = 'high') {
     this.setPreset(name);
@@ -65,6 +74,13 @@ export class Quality {
     this.history = new Float32Array(90);
     this.historyIndex = 0;
     this.onDowngrade = null;
+    // Recovery state: the tier the user (or auto-detect) actually asked for is
+    // the ceiling the adaptive loop may climb back to. Only tiers the loop
+    // itself took away are ever handed back.
+    this._goodMs = 0;
+    this._recoverCooldown = 0;
+    this._recoverBackoff = 1;
+    this._adaptiveChange = false;
   }
 
   setPreset(name, scale = 1.0) {
@@ -72,6 +88,27 @@ export class Quality {
     Object.assign(this, PRESETS[this.presetName]);
     this.dynamicScale = scale;
     this._cooldown = 2.0;
+    this._goodMs = 0;
+    if (!this._adaptiveChange) {
+      // A hand-picked preset is the new ceiling and forgets any adaptive history.
+      this.userTier = this.presetName;
+      this._recoverBackoff = 1;
+      this._recoverCooldown = 0;
+    }
+  }
+
+  /** Name of the preset one tier dearer, capped at the user's own choice. */
+  tierAbove() {
+    const i = TIERS.indexOf(this.presetName);
+    const cap = TIERS.indexOf(this.userTier ?? this.presetName);
+    if (i < 0 || cap < 0) return null;
+    return i > cap ? TIERS[i - 1] : null;
+  }
+
+  /** Route a preset change through the app without it counting as a user pick. */
+  _change(name, scale) {
+    this._adaptiveChange = true;
+    try { this.onDowngrade(name, scale); } finally { this._adaptiveChange = false; }
   }
 
   get effectiveScale() { return this.renderScale * this.dynamicScale; }
@@ -108,7 +145,8 @@ export class Quality {
       // Hand the floor scale down with it, so the rebuild allocates the small
       // targets directly rather than building full-size ones and discarding
       // them on the very next line.
-      this.onDowngrade(tier, MIN_SCALE);
+      this._noteDowngrade();
+      this._change(tier, MIN_SCALE);
       this._cooldown = 3.0;
       return true;
     }
@@ -118,6 +156,28 @@ export class Quality {
     this.dynamicScale = MIN_SCALE;
     this._cooldown = 2.0;
     return Math.abs(prev - this.dynamicScale) > 1e-4;
+  }
+
+  /** A downgrade that undoes a recent recovery makes the next recovery slower. */
+  _noteDowngrade() {
+    if (this._recoverCooldown > 0) this._recoverBackoff = Math.min(this._recoverBackoff * 2, 8);
+  }
+
+  /**
+   * The one-way ratchet's release. A tier is handed back only when the loop
+   * took it, the resolution has already climbed back to full, and the median
+   * frame time has stayed comfortably under budget for a long window.
+   */
+  _recover() {
+    if (this._recoverCooldown > 0) return false;
+    const tier = this.tierAbove();
+    if (!tier || !this.onDowngrade) { this._goodMs = 0; return false; }
+    if (this._goodMs < RECOVER_WINDOW_S * 1000 * this._recoverBackoff) return false;
+    this._change(tier, 1.0);
+    this._cooldown = 4.0;
+    this._recoverCooldown = RECOVER_COOLDOWN_S * this._recoverBackoff;
+    this._goodMs = 0;
+    return true;
   }
 
   /**
@@ -143,10 +203,17 @@ export class Quality {
     if (this._count < SAMPLE_FRAMES && this._acc < SAMPLE_MS) return false;
 
     const n = this._count;
+    const windowMs = this._acc;
     const avg = this._acc / n;
     const med = this._median(n);
     this._acc = 0;
     this._count = 0;
+
+    // Recovery bookkeeping runs on wall time, cooldowns included: a quiet
+    // window is quiet whether or not the loop was allowed to act on it.
+    if (med < this.targetMs * RECOVER_RATIO && this.dynamicScale >= 1.0 - 1e-4) this._goodMs += windowMs;
+    else this._goodMs = 0;
+    if (this._recoverCooldown > 0) this._recoverCooldown -= windowMs / 1000;
     if (this._cooldown > 0) return false;
 
     // Panic decides on the median. A single two-second shader compile drags
@@ -158,7 +225,8 @@ export class Quality {
     if (avg > this.targetMs * 1.25) {
       const tier = this.tierBelow(1);
       if (this.dynamicScale <= MIN_SCALE + 0.06 && tier && this.onDowngrade) {
-        this.onDowngrade(tier, 1.0);
+        this._noteDowngrade();
+        this._change(tier, 1.0);
         this._cooldown = 4.0;
         return true;
       }
@@ -167,6 +235,7 @@ export class Quality {
     } else if (avg < this.targetMs * 0.68) {
       this.dynamicScale = Math.min(1.0, this.dynamicScale + 0.045);
       this._cooldown = 1.5;
+      if (this._recover()) return true;
     }
     return Math.abs(prev - this.dynamicScale) > 1e-4;
   }

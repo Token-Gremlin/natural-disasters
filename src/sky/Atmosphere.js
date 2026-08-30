@@ -259,7 +259,7 @@ export class Atmosphere {
       uRes: { value: AP_RES },
     }, { name: 'aerialLUT' });
 
-    this._lutTurbidity = -1;
+    this._lutSig = '';
     this.sunColor = new THREE.Color(1, 1, 1);
     this.ambientColor = new THREE.Color(0.1, 0.2, 0.35);
     this._readBuf = new Float32Array(4);
@@ -273,15 +273,21 @@ export class Atmosphere {
 
   /** Heavy LUTs — only rebuilt when the medium itself changes. */
   buildStaticLUTs(force = false) {
-    if (!force && Math.abs(this.turbidity - this._lutTurbidity) < 0.02) return;
-    this._lutTurbidity = this.turbidity;
+    const a = this.groundAlbedo;
+    const sig = `${this.turbidity.toFixed(1)}|${this.mieG.toFixed(3)}|${a.r.toFixed(3)},${a.g.toFixed(3)},${a.b.toFixed(3)}`;
+    if (!force && sig === this._lutSig) return;
+    this._lutSig = sig;
     this._syncCommon(this.tPass);
     this._syncCommon(this.msPass);
     this.tPass.render(this.renderer, this.transmittanceRT);
     this.msPass.render(this.renderer, this.multiScatterRT);
   }
 
-  update(camera, camPos) {
+  /**
+   * @param {THREE.Matrix4} [invViewProjNJ] unjittered inverse view-projection;
+   *   the AP LUT is looked up through U.uInvViewProjNJ so it must match.
+   */
+  update(camera, camPos, invViewProjNJ = null) {
     this.buildStaticLUTs();
     this._syncCommon(this.skyPass);
     this.skyPass.uniforms.uSunDir.value.copy(this.sunDir);
@@ -291,7 +297,8 @@ export class Atmosphere {
     this._syncCommon(this.apPass);
     this.apPass.uniforms.uSunDir.value.copy(this.sunDir);
     this.apPass.uniforms.uCamPos.value.copy(camPos);
-    this.apPass.uniforms.uInvViewProj.value
+    if (invViewProjNJ) this.apPass.uniforms.uInvViewProj.value.copy(invViewProjNJ);
+    else this.apPass.uniforms.uInvViewProj.value
       .multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
     this.apPass.render(this.renderer, this.aerialRT);
 
@@ -332,7 +339,7 @@ export class Atmosphere {
     u.uSunIntensity = { value: this.sunIntensity };
     u.uAtmoTurbidity = { value: this.turbidity };
     u.uAtmoMieG = { value: this.mieG };
-    u.uAtmoGroundAlbedo = { value: new THREE.Vector3(0.06, 0.09, 0.12) };
+    u.uAtmoGroundAlbedo = { value: new THREE.Vector3(this.groundAlbedo.r, this.groundAlbedo.g, this.groundAlbedo.b) };
     return u;
   }
 
@@ -342,6 +349,7 @@ export class Atmosphere {
     if (u.uSunIntensity) u.uSunIntensity.value = this.sunIntensity;
     if (u.uAtmoTurbidity) u.uAtmoTurbidity.value = this.turbidity;
     if (u.uAtmoMieG) u.uAtmoMieG.value = this.mieG;
+    if (u.uAtmoGroundAlbedo) u.uAtmoGroundAlbedo.value.set(this.groundAlbedo.r, this.groundAlbedo.g, this.groundAlbedo.b);
   }
 }
 

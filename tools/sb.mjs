@@ -44,7 +44,7 @@ const showWindow = has('show');
 const browser = await puppeteer.launch({
   headless: false,
   args: [
-    '--ignore-gpu-blocklist', '--enable-gpu-rasterization', '--use-angle=d3d11',
+    '--ignore-gpu-blocklist', '--enable-gpu-rasterization', process.platform === 'win32' ? '--use-angle=d3d11' : '--use-angle=metal',
     '--disable-gpu-vsync', '--disable-frame-rate-limit',
     '--no-sandbox', '--disable-dev-shm-usage',
     // Chrome suspends requestAnimationFrame in a window it thinks nobody is
