@@ -111,6 +111,20 @@ float fbm2Tiled(vec2 p, float period, int octaves){
   return f;
 }
 
+// Seamless fbm over the unit square: N lattice cells across the texture,
+// each octave doubling and wrapping. (fbm2Tiled above scales the *period*, not
+// the position, so over a unit-square bake it only ever covers one lattice
+// cell and the texture does not repeat — a seam every tile.)
+float fbm2Seamless(vec2 p, float cells, int octaves){
+  float f = 0.0, amp = 0.5, c = cells;
+  for (int i = 0; i < 8; i++) {
+    if (i >= octaves) break;
+    f += amp * vnoise2Tiled(p * c, c);
+    c *= 2.0; amp *= 0.5;
+  }
+  return f;
+}
+
 // Interleaved gradient noise — cheap per-pixel dithering
 float ign(vec2 p){ return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 

@@ -8,57 +8,114 @@ import { NOISE_GLSL } from '../gfx/NoiseGLSL.js';
 /**
  * Raymarched volumetric cloud layer.
  *
- * The layer is a spherical shell around the planet so it curves down to the
- * horizon instead of ending in a flat plate. Density comes from the baked
- * Perlin-Worley 3D volume, eroded by a smaller worley volume; lighting uses a
- * short march toward the sun with a Beer-Powder term, dual-lobe HG phase and a
- * three-octave multiple-scattering approximation.
+ * Structure follows the Horizon: Zero Dawn / Nubis recipe, with one deliberate
+ * change of emphasis: the 2D weather map, not the 3D shape volume, decides
+ * where cloud is. The map is 1024² over ~40 km, so a cell footprint is drawn
+ * at ~40 m resolution with a crisp, warped-worley outline. The 128³ shape
+ * volume then only has to carve billows *inside* a footprint, where the
+ * threshold sits in the middle of its distribution — never at the tail, which
+ * is where a trilinear volume prints its own voxel lattice as bricks.
  *
- * Cost is controlled by rendering at a fraction of screen resolution and
- * reprojecting the previous frame, so only a slice of the rays is new work.
+ * Every low-resolution pixel is marched every frame with a per-frame jittered
+ * start, and the result is accumulated temporally with reprojection along the
+ * cloud's own depth. There is no checkerboard: the old 1/16-per-frame
+ * amortisation could only ever converge with the camera locked, and stamped
+ * its 4×4 grid over every silhouette the moment it moved.
  */
 
-// Screen centre plus the four corners: enough to catch a pan, a dolly and a
-// roll without running a full motion-vector pass for one scalar.
 const PROBE_NDC = [[0, 0], [-1, -1], [1, -1], [-1, 1], [1, 1]];
 const _pa = new THREE.Vector3();
 const _pb = new THREE.Vector3();
+
+/**
+ * Weather-map decoding, shared verbatim with the ocean's cloud-shadow term so
+ * the shadow on the water is the cloud overhead and nothing else.
+ * Returns (coverage 0..1, type 0..1, base lift, tallness 0..1).
+ */
+export const WEATHER_GLSL = /* glsl */ `
+uniform sampler2D uWeatherMap;
+uniform vec4  uWeatherLo;
+uniform vec4  uWeatherHi;
+uniform float uWeatherScaleM;   // metres per weather-map repeat
+uniform float uCoverage;
+uniform float uAnvil;
+uniform vec2  uCloudWind;
+uniform float uCloudTime;
+
+vec4 weatherTex(vec2 uv) {
+  // Explicit LOD, always: derivatives are meaningless inside a raymarch.
+  return clamp((textureLod(uWeatherMap, uv, 0.0) - uWeatherLo) / (uWeatherHi - uWeatherLo), 0.0, 1.0);
+}
+
+vec4 weatherAt(vec2 xz) {
+  vec2 w = xz + uCloudWind * uCloudTime * 0.6;
+  vec4 m = weatherTex(w / uWeatherScaleM);
+  // A second, finer read of the same map: the small cumulus that live in the
+  // gaps between the big cells. It drifts a little differently so a system
+  // evolves as it crosses the sky instead of sliding past rigidly.
+  vec4 n = weatherTex(w / (uWeatherScaleM * 0.37) + vec2(0.37, 0.11)
+                      - uCloudWind * uCloudTime * 0.00001);
+  // Synoptic lanes: strong in a broken sky, gone in an overcast one. Baking
+  // the product into the map made the lanes permanent holes that no coverage
+  // setting could fill.
+  float sc = smoothstep(0.40, 0.85, uCoverage);
+  float lane = mix(0.45 + 0.55 * m.g, 1.0, sc);
+  float field = (m.r * 0.66 + n.r * 0.34) * lane;
+
+  // The map is percentile-normalised, so a threshold of (1 - coverage) covers
+  // about that fraction of the sky. The edge is soft in field space, which in
+  // world space is a ragged 100-300 m fringe rather than a cut line.
+  float th = 1.0 - uCoverage;
+  float c = smoothstep(th - 0.14, th + 0.10, field) * smoothstep(0.0, 0.04, uCoverage);
+  // Cores of a cell are fuller than its fringe. This is also what keeps the 3D
+  // threshold in the middle of the shape distribution inside a footprint.
+  c *= 0.55 + 0.45 * smoothstep(th, min(th + 0.6, 1.0), field);
+
+  // Type: 0 stratus, 0.5 cumulus, 1 cumulonimbus. Broken-to-overcast skies are
+  // stratocumulus; towers appear only when the storm control asks for them,
+  // and then only over the convective cores of a deep system.
+  // Towers are things you see from outside: under a near-overcast storm the
+  // sky is a nimbostratus ceiling, not a skyline, so the tower term fades out
+  // with coverage and the deck thickens and darkens instead.
+  float storm = smoothstep(0.45, 0.9, uAnvil);
+  float type = 0.34 + 0.16 * m.g - 0.30 * sc
+             + storm * (1.0 - sc) * (0.08 + 0.95 * m.a * smoothstep(0.35, 0.8, m.b));
+  type = clamp(type, 0.0, 1.0);
+  // Bases ride a little with the system and with the cell, so the floor is
+  // not one geometric plane.
+  float lift = (m.g - 0.5) * 0.10 + (n.g - 0.5) * 0.06;
+  // How tall a cumulus this column can carry: only the big cells grow; the
+  // small puffs between them stay squat.
+  float tall = smoothstep(0.50, 1.0, m.b) * (1.0 - 0.55 * sc);
+  return vec4(c, type, lift, tall);
+}
+`;
 
 const CLOUD_COMMON = /* glsl */ `
 uniform sampler3D uCloudShape;
 uniform sampler3D uCloudDetail;
 uniform sampler2D uCurlTex;
-uniform sampler2D uWeatherMap;
-uniform float uWeatherScaleM;   // metres per weather-map repeat
 uniform vec4 uShapeLo;
 uniform vec4 uShapeHi;
 uniform vec4 uDetailLo;
 uniform vec4 uDetailHi;
 
-uniform float uCoverage;
 uniform float uCloudDensity;
 uniform float uCloudBottom;
 uniform float uCloudTop;
-uniform float uAnvil;
-uniform float uStorm;
-uniform vec2  uCloudWind;
-uniform float uCloudTime;
-uniform float uCloudScaleM;    // metres per shape-texture repeat
-uniform float uCloudAspect;    // vertical squash: how many cells fit in the deck
-uniform float uCloudContrast;  // how hard the weather map breaks the deck up
+uniform float uCloudScaleM;    // metres per shape-volume repeat
+uniform float uDetailScaleM;   // metres per detail-volume repeat
 uniform float uSunIntensity;
 uniform vec3  uSunDir;
 uniform float uAmbientFlash;
-
-// Skylight reaching the deck, in the same units as everything else in the
-// frame. Written once per fragment from the sky LUT rather than carried as a
-// uniform, because an ad-hoc ambient constant is impossible to keep in step
-// with the sun's intensity and leaves storm cloud undersides pure black.
-vec3 gAmbTop = vec3(0.0);
-vec3 gAmbBottom = vec3(0.0);
 uniform vec3  uLightningColor;
 uniform vec4  uLightning0;
 uniform vec4  uLightning1;
+
+${WEATHER_GLSL}
+
+vec3 gAmbTop = vec3(0.0);
+vec3 gAmbBottom = vec3(0.0);
 
 const float PLANET_R = 6360000.0;
 
@@ -75,180 +132,131 @@ vec4 detailTex(vec3 uvw) {
 }
 
 /**
- * Vertical density profile. The type parameter runs 0 = flat stratus slab,
- * 0.5 = fair weather cumulus, 1 = full cumulonimbus tower with an anvil.
+ * Vertical density profile in layer units. type 0 = thin stratus sheet,
+ * 0.5 = cumulus with a flat base and a rounded top, 1 = cumulonimbus tower
+ * that fills the whole layer and flares into an anvil.
  */
 float heightProfile(float h, float type) {
-  // Blend where the profile rises and falls, not two already-evaluated curves.
-  // Averaging a low stratus slab against a taller cumulus gives a curve that
-  // never reaches 1 — above h=0.38 the old blend capped at 0.6, and since the
-  // coverage threshold sits near 0.9 that made cloud *impossible* up there. The
-  // deck collapsed into flat-lidded slabs all topping out at one altitude,
-  // because the only thing still clearing the threshold was the narrow band
-  // where both curves happened to overlap.
-  float t = clamp(type * 2.0, 0.0, 1.0);
-  float rise = mix(0.05, 0.13, t);       // stratus base is crisper than cumulus
-  float fallFrom = mix(0.16, 0.48, t);   // where the shoulders start eroding
-  float fallTo = mix(0.38, 0.95, t);     // and where nothing is left
-  float lo = smoothstep(0.0, rise, h) * (1.0 - smoothstep(fallFrom, fallTo, h));
-
-  // column that punches the whole deck and flares into an anvil
-  float tower = smoothstep(0.0, 0.04, h) * (1.0 - smoothstep(0.88, 1.0, h));
-  float anvil = smoothstep(0.58, 0.74, h) * (1.0 - smoothstep(0.90, 1.0, h));
-  float cb = max(tower * 0.9, anvil);
-
-  return mix(lo, cb, clamp(type * 2.0 - 1.0, 0.0, 1.0));
+  // The base is a hard cut: cloud condenses at one altitude and a cumulus
+  // base is flat. A soft rise here runs through the coverage threshold and
+  // tapers every cell to a hanging point.
+  float st = smoothstep(0.0, 0.05, h) * (1.0 - smoothstep(0.40, 1.0, h));
+  float cu = smoothstep(0.0, 0.05, h) * (1.0 - smoothstep(0.45, 1.0, h));
+  float cb = smoothstep(0.0, 0.05, h) * (1.0 - smoothstep(0.82, 1.0, h));
+  float anvil = smoothstep(0.62, 0.78, h) * (1.0 - smoothstep(0.90, 1.0, h));
+  cb = max(cb, anvil);
+  float t = type * 2.0;
+  return t < 1.0 ? mix(st, cu, t) : mix(cu, cb, clamp(t - 1.0, 0.0, 1.0));
 }
 
-/**
- * Large-scale organisation. A real sky is never statistically uniform: cells
- * come in clusters and bands tens of kilometres across with clear lanes
- * between them, and that structure is most of what the eye uses to judge
- * whether a cloudscape is real. Returns (coverage, type, base lift).
- */
-vec3 weatherAt(vec2 xz) {
-  // The map drifts as a whole and the cells inside it drift again, so a system
-  // evolves as it crosses the sky instead of sliding past rigidly.
-  // Explicit level, always. Screen-space derivatives inside a raymarch loop are
-  // meaningless — neighbouring fragments are at different steps, or have exited
-  // entirely — and letting the hardware pick a mip from them tears the deck
-  // along hard seams wherever the chosen level happens to change.
-  vec2 w = xz + uCloudWind * uCloudTime * 0.6;
-  vec4 m = textureLod(uWeatherMap, w / uWeatherScaleM, 0.0);
-  vec4 n = textureLod(uWeatherMap, w / (uWeatherScaleM * 0.27)
-                 + vec2(0.37, 0.11) - uCloudWind * uCloudTime * 0.00002, 0.0);
-
-  float field = m.r * 0.62 + m.g * 0.22 + n.g * 0.16;
-  // Contrast pivots about the requested coverage: uCoverage says how much sky
-  // is cloud, the field says where. Narrowing that spread near the ends is
-  // tempting but wrong — it starves exactly the light-coverage case, where each
-  // surviving cell is already only a few shape voxels across and turns to
-  // cubes. Instead only the zero itself is gated, because the pivot alone lets
-  // an above-average field manufacture cloud out of a request for none, and
-  // "clear sky" has to actually clear.
-  float cover = clamp((field - 0.5) * uCloudContrast + uCoverage, 0.0, 1.0)
-              * smoothstep(0.0, 0.05, uCoverage);
-  // Cloud type: 0 is a flat stratus slab, 0.5 a fair-weather cumulus, 1 a
-  // cumulonimbus tower. Fair weather is made of cumulus, so the floor sits
-  // there and the storm control lifts the deepest cells into towers. Running
-  // the whole range off uAnvil meant a clear day was drawn as a field of
-  // stratus pancakes — the right density in entirely the wrong shape.
-  float type = clamp(0.30 + 0.20 * m.b + uAnvil * (0.34 + 0.55 * m.b + 0.6 * m.a), 0.0, 1.0);
-  // How far this column's whole profile rides above or below the nominal deck.
-  // Without it the base is a geometric plane at a constant altitude, and once
-  // coverage is high enough to close the gaps an observer underneath sees a
-  // featureless grey ceiling — which is why an overcast storm can end up
-  // reading as flat haze while the same cloud model looks fine at a distance.
-  float lift = (n.r * 0.6 + m.g * 0.4 - 0.5) * 0.34;
-  return vec3(cover, type, lift);
-}
-
-// diagnostics: last raw shape value / post-threshold base, read by the probe
+// diagnostics
 float gShapeR = 0.0;
 float gBase = 0.0;
-// march internals, written unconditionally and only read when uCloudDebug asks
 float gT0 = 0.0, gT1 = 0.0, gIters = 0.0, gSpent = 0.0, gCov = 0.0;
+// ambient occlusion from the erosion field: crevices see less sky (HDRP trick)
+float gAO = 1.0;
+
+/** Two taps: is there any cloud in this column at all? Drives empty-space skipping. */
+float columnCoverage(vec3 p, float h) {
+  vec2 xz = p.xz + uCloudWind * uCloudTime * h * 1.2;
+  return weatherAt(xz).x;
+}
 
 /**
- * @param detail how much erosion to apply, 0..2. Continuous on purpose: a hard
- *   LOD switch changes the density, not just its frequency content, and since
- *   the switch happens at a fixed distance it stamps a sharp arc across the sky
- *   wherever the deck crosses it.
+ * @param p      planet-relative position (metres)
+ * @param h      height through the layer, 0..1
+ * @param detail erosion strength 0..2 (continuous so no LOD arc prints)
  */
 float cloudDensity(vec3 p, float h, float detail) {
-  // Higher layers outrun the base: the shear is what tilts a tower downwind
-  // and smears its anvil, and it costs nothing.
+  // Wind shear: upper levels outrun the base, tilting towers and smearing anvils.
   vec3 q = p;
-  q.xz += uCloudWind * uCloudTime * (0.6 + h * 1.5);
+  q.xz += uCloudWind * uCloudTime * h * 1.2;
 
-  vec3 wm = weatherAt(q.xz);
+  vec4 wm = weatherAt(q.xz);
+  float cov = wm.x;
   float type = wm.y;
-  // Anvils spread aloft, so the top of a mature cell covers far more sky — but
-  // only a mature cell does. Keyed on plain cumulus this lays a translucent
-  // sheet across the entire top of the deck and the sky hazes over.
-  float anvilness = smoothstep(0.62, 1.0, type);
-  float cov = mix(wm.x, min(wm.x * 1.8 + 0.24, 1.0), smoothstep(0.55, 0.88, h) * anvilness);
+  float cbness = clamp(type * 2.0 - 1.0, 0.0, 1.0);
+  float stness = 1.0 - clamp(type * 2.0, 0.0, 1.0);
+  // Anvils spread aloft, so the top of a mature cell covers more sky.
+  cov = mix(cov, min(cov * 1.6 + 0.22, 1.0), smoothstep(0.62, 0.90, h) * cbness);
   gCov = max(gCov, cov);
-  if (cov <= 0.01) return 0.0;
+  if (cov <= 0.002) return 0.0;
 
-  // Ride the whole profile up or down with the system. heightProfile is zero
-  // outside the unit interval, so this carves a ragged base and top rather than
-  // merely fading the slab.
-  float hs = h - wm.z;
+  // Vertical extent is a property of the cell, in metres, not a fraction of
+  // whatever layer the weather asked for: a fair-weather cumulus tops out a
+  // kilometre or two above its base whether the layer is 2 km or 6 km deep,
+  // and only a cumulonimbus fills the layer. Fuller columns grow taller.
+  float thickness = uCloudTop - uCloudBottom;
+  float cuTop = mix(320.0, 1500.0, wm.w * wm.w);
+  float topM = mix(mix(cuTop, 380.0, stness), thickness, cbness);
+  // A rain deck is a kilometre or more thick, ragged underneath.
+  topM *= 1.0 + 1.6 * smoothstep(0.45, 0.9, uAnvil) * smoothstep(0.40, 0.85, uCoverage);
+  float hs = (h * thickness - wm.z * topM) / topM;
   if (hs <= 0.0 || hs >= 1.0) return 0.0;
+  float prof = heightProfile(hs, type);
+  if (prof <= 0.002) return 0.0;
+  // Cells lean inward with height so a footprint becomes a dome, not a pillar.
+  cov *= 1.0 - hs * mix(0.62, 0.25, cbness);
 
-  vec3 uvw = q / uCloudScaleM;
-  uvw.y *= uCloudAspect;
-  // Scattered cloud slices the top few percent of the shape field, and the
-  // maxima of a trilinearly interpolated 128^3 volume are its own voxel corners
-  // — so at low coverage the sky came out as a field of axis-aligned bricks. A
-  // domain warp finer than that lattice moves the isosurface off it without
-  // touching the value distribution, so coverage still means what it says.
-  vec3 warp = (detailTex(uvw * 11.0).rgb - 0.5) * 0.011;
+  // A tower is one billow kilometres across, not a stack of cumulus-sized
+  // ones: the shape field is read at a coarser scale as the column matures.
+  vec3 uvw = q / (uCloudScaleM * mix(1.0, 2.2, cbness));
+  // Sub-voxel domain warp: moves the isosurface off the trilinear lattice so
+  // a near-flat face does not print the volume's voxel terraces. Only the
+  // view samples need it; the hunt and the light march skip the tap.
+  vec3 warp = detail > 0.001 ? (detailTex(uvw * 9.0).rgb - 0.5) * 0.012 : vec3(0.0);
   vec4 shape = shapeTex(uvw + warp);
-
   float fbmLow = shape.g * 0.625 + shape.b * 0.25 + shape.a * 0.125;
-  // Schneider's dilation: widen the perlin-worley field by its own fbm so the
-  // billows stay connected instead of breaking into popcorn
-  float base = remap(shape.r, fbmLow * 0.92 - 1.0, 1.0, 0.0, 1.0);
-  base *= heightProfile(hs, type);
+  // Both channels are percentile-normalised, so this field is roughly uniform
+  // on [0,1]: the coverage threshold below then removes a predictable fraction
+  // of the volume. Perlin-worley keeps it connected; the worley fbm adds the
+  // cauliflower lobes.
+  float base = mix(shape.r, fbmLow, 0.35) * prof;
   gShapeR = max(gShapeR, shape.r);
   gBase = max(gBase, base);
 
-  // Coverage sweeps a threshold across the base distribution. The dilation
-  // above lifts the mean of base well past 0.5, so the sweep still has to start
-  // near 1.0 for zero coverage to mean a genuinely empty sky. What it must not
-  // do is spend the low end of its travel up in the tail: sliced above ~0.85 a
-  // cell is only three or four shape-texture voxels across, and a trilinear
-  // blob that small is a rounded box that no amount of erosion can rescue. The
-  // gamma keeps both endpoints exact and gets off the tail quickly, so light
-  // coverage means a few real cumulus rather than a field of bricks.
-  float d = remap(base, mix(0.99, 0.20, pow(cov, 0.67)), 1.0, 0.0, 1.0);
+  // Coverage was decided in 2D; here it sets how much of the billow field
+  // survives inside the footprint. Even a full cell keeps ~40% of its volume
+  // empty, which is what leaves it a surface with relief instead of a block.
+  float ct = cov * 0.62;
+  float d = remap(base, 1.0 - ct, 1.0, 0.0, 1.0);
   if (d <= 0.0) return 0.0;
-
-  // A cloud is not a soft blob: liquid water content ramps up fast just inside
-  // the boundary. The smoothstep puts that hard edge back, which is most of
-  // what separates "convincing cumulus" from "grey smudge".
-  d = d * d * (3.0 - 2.0 * d);
+  d *= smoothstep(0.0, 0.5, cov);
 
   float w1 = clamp(detail, 0.0, 1.0);
   if (w1 > 0.001) {
-    // Curl-distorted erosion: wispy tendrils at the base where the updraught
-    // shears, cauliflower billows at the top where it punches through.
-    vec2 curl = textureLod(uCurlTex, uvw.xz * 3.1, 0.0).rg * 2.0 - 1.0;
-    vec3 dp = q / (uCloudScaleM * 0.2);
-    dp.xz += curl * (1.0 - h) * 3.5;
+    // Curl-warped erosion: wispy at the base where the updraught shears,
+    // cauliflower at the top where it punches through.
+    vec2 curl = textureLod(uCurlTex, uvw.xz * 1.7, 0.0).rg * 2.0 - 1.0;
+    vec3 dp = q / uDetailScaleM;
+    dp.xz += curl * (1.0 - hs) * 0.08;
     vec3 det = detailTex(dp).rgb;
     float detFbm = det.r * 0.625 + det.g * 0.25 + det.b * 0.125;
-    float mod3 = mix(1.0 - detFbm, detFbm, clamp(h * 4.0, 0.0, 1.0));
-    // Erosion bites hardest at the silhouette and barely at all in the core,
-    // which is what turns a smooth blob into billows. It used to be capped low
-    // so the boundary could not flicker between amortisation phases — but the
-    // cure for that belongs in the resolve, and paying for it here meant never
-    // carving a shape in the first place.
-    float bite = mix(0.78, 0.14, smoothstep(0.20, 0.78, d));
+    float mod3 = mix(detFbm, 1.0 - detFbm, clamp(hs * 4.0, 0.0, 1.0));
+    gAO = 1.0 - sqrt(mod3 * 0.45) * w1;
+    // Bites hardest at the silhouette, barely in the core: that is what turns
+    // a smooth blob into billows without hollowing the cell out.
+    float bite = mix(0.55, 0.12, smoothstep(0.15, 0.7, d));
     d = mix(d, remap(d, mod3 * bite, 1.0, 0.0, 1.0), w1);
     if (d <= 0.0) return 0.0;
 
     float w2 = clamp(detail - 1.0, 0.0, 1.0);
     if (w2 > 0.001) {
-      // The octave that actually reads as cauliflower: tens of metres across,
-      // on the lit shoulders. Warped by the curl again at a different rate so
-      // it never sits in register with the octave above it.
-      vec3 fp = dp * 3.1;
-      fp.xz += curl * 0.9;
+      vec3 fp = dp * 3.7;
+      fp.xz += curl * 0.15;
       vec3 fine = detailTex(fp).rgb;
       float f = fine.r * 0.62 + fine.g * 0.26 + fine.b * 0.12;
-      float fbite = mix(0.46, 0.08, smoothstep(0.25, 0.85, d));
+      float fbite = mix(0.32, 0.05, smoothstep(0.2, 0.8, d));
       d = mix(d, remap(d, f * fbite, 1.0, 0.0, 1.0), w2);
       if (d <= 0.0) return 0.0;
     }
   }
 
-  return clamp(d, 0.0, 1.0) * uCloudDensity;
+  // Liquid water content climbs quickly above a flat base.
+  float grad = mix(0.5, 1.0, smoothstep(0.0, 0.25, hs));
+  return clamp(d, 0.0, 1.0) * grad * uCloudDensity;
 }
 
-/** Intersect a ray with a sphere of radius r centred at the planet core. */
 vec2 shellIntersect(vec3 ro, vec3 rd, float r) {
   float b = dot(ro, rd);
   float c = dot(ro, ro) - r * r;
@@ -259,15 +267,13 @@ vec2 shellIntersect(vec3 ro, vec3 rd, float r) {
 }
 
 /**
- * Folds atmospheric extinction between the eye and the cloud into the layer,
- * so distant cells wash out into the horizon haze exactly like the real thing.
- * Returns the premultiplied layer colour for "sky * a + rgb" compositing.
+ * Atmospheric extinction and in-scatter between the eye and the cloud, so
+ * distant cells wash out into the horizon haze. Returns the premultiplied
+ * layer colour for "sky * a + rgb" compositing.
  */
 vec3 applyAerial(vec3 scatter, float transmittance, float dist, vec3 hazeColor) {
   if (dist <= 0.0) return scatter;
-  // sea-level extinction, thinned a little for the altitude of the deck
-  vec3 beta = (vec3(5.802e-6, 13.558e-6, 33.1e-6)
-             + vec3(3.996e-6) * uAtmoTurbidity) * 0.72;
+  vec3 beta = (vec3(5.802e-6, 13.558e-6, 33.1e-6) + vec3(3.996e-6) * uAtmoTurbidity) * 0.72;
   vec3 Ta = exp(-beta * dist);
   return scatter * Ta + hazeColor * (1.0 - Ta) * (1.0 - transmittance);
 }
@@ -288,96 +294,69 @@ const CLOUD_MARCH = /* glsl */ `
 uniform int uSteps;
 uniform int uLightSteps;
 uniform sampler2D uSkyAmbLUT;
-// Ranges over which the two erosion octaves fade out, in metres along the ray.
-uniform vec3 uDetailFade;
+uniform vec3 uDetailFade;   // metres along the ray where the erosion octaves retire
 
-/**
- * Skylight arriving at the deck, split into what reaches the tops and what
- * crawls in under the base. Both come straight out of the sky LUT so they
- * track sunset, overcast and night without any hand-tuned constants.
- */
 void skyAmbient(vec3 viewPos, vec3 rd) {
   vec3 up = getValFromSkyLUT(uSkyAmbLUT, viewPos, vec3(0.0, 1.0, 0.0), uSunDir);
-  // Under a deck the only light comes in sideways from the bright ring at the
-  // horizon, then bounces once off the water on its way up.
-  vec3 side = getValFromSkyLUT(uSkyAmbLUT, viewPos,
-                normalize(vec3(rd.x, 0.07, rd.z)), uSunDir);
-  // Skylight is blue and comes from everywhere, so it is also the term that
-  // flattens a cloud. Too much of it and a sunlit cumulus reads as a pale blue
-  // smudge with no lit side and no shaded side — which is not a lighting bug
-  // you can tonemap your way out of, it is the shape disappearing.
-  gAmbTop = up * uSunIntensity * 1.45;
-  // Still generous. A deck kilometres thick is optically opaque, so a strictly
-  // single-scattering base integrates to black and the overcast stops reading
-  // as weather and starts reading as night. The light is really there: it
-  // arrives sideways from the bright ring under the deck edge and is piped
-  // through the cloud by high-order scattering the light march truncates.
-  gAmbBottom = (side * 0.50 + up * 0.15) * uSunIntensity * vec3(0.80, 0.88, 1.0);
+  vec3 side = getValFromSkyLUT(uSkyAmbLUT, viewPos, normalize(vec3(rd.x, 0.08, rd.z)), uSunDir);
+  // The LUT is per unit solar irradiance. Averaged over the upper hemisphere
+  // the sky is brighter than its zenith, hence the factor above one.
+  gAmbTop = (up * 0.8 + side * 0.5) * uSunIntensity;
+  // Under a deck the only light left is what leaks in sideways from the bright
+  // ring at the horizon and bounces up off the water: dim, and blue-grey.
+  gAmbBottom = (side * 0.28 + up * 0.08) * uSunIntensity * vec3(0.82, 0.88, 1.0);
 }
 
-// Extinction per unit density per metre. Real cumulus sit around 0.05/m, which
-// makes a 500 m cell optically thick enough to hide the sun completely; we run
-// a little under that because the raymarch cannot afford steps short enough to
-// resolve the ~20 m skin where all the visible shading actually happens.
-const float SIGMA = 0.022;
+// Extinction per unit density per metre. Real cumulus are 0.04-0.08/m.
+// Rain-bearing cloud is denser and darker (HDRP runs 0.04 fair to 0.12 rain).
+#define SIGMA (0.05 + 0.05 * uAnvil)
 
 /**
- * Energy-conserving multiple-scattering approximation (Wrenninge octaves).
- * Light taps grow exponentially so a handful of samples still cover the deck.
+ * Light reaching p from the sun, with a Wrenninge-style multiple-scattering
+ * approximation (three octaves of successively dimmer, more penetrating
+ * light) and Beer-Powder edge darkening.
  */
-vec3 sampleLight(vec3 p, float mu, vec3 sunColor, float selfDensity, float jitter, int steps) {
+vec3 sampleLight(vec3 p, float mu, vec3 sunColor, float jitter, int steps) {
   vec3 ld = uSunDir;
-  float thickness = uCloudTop - uCloudBottom;
-  float stepLen = thickness * 0.045;
+  float stepLen = 22.0;
   float depth = 0.0;
-  // Small: the shadow march is smooth, so jitter here buys almost no banding
-  // relief and costs visible noise in the lighting.
-  float travelled = stepLen * (0.25 + 0.3 * jitter);
+  float travelled = stepLen * (0.3 + 0.4 * jitter);
+  float thickness = uCloudTop - uCloudBottom;
   for (int i = 0; i < 8; i++) {
     if (i >= steps) break;
     travelled += stepLen;
     vec3 sp = p + ld * travelled;
-    float sh = clamp((length(sp) - (PLANET_R + uCloudBottom)) / thickness, 0.0, 1.0);
-    // base octave only: the shadow of a wisp is not worth a 3D texture fetch
-    depth += cloudDensity(sp, sh, 0.0) * stepLen;
-    stepLen *= 1.62;
+    float sh = (length(sp) - (PLANET_R + uCloudBottom)) / thickness;
+    if (sh > 1.0) break;
+    depth += cloudDensity(sp, clamp(sh, 0.0, 1.0), 0.0) * stepLen;
+    stepLen *= 1.65;
   }
+  float od = depth * SIGMA;
 
   vec3 lum = vec3(0.0);
   float a = 1.0, b = 1.0, c = 1.0;
+  // Powder: the crevices of a lit face are darker than the bulges because a
+  // photon has to scatter more than once to leave them. Strongest looking
+  // toward the sun, gone looking away.
+  float powder = 1.0 - exp(-od * 2.0);
+  float powderW = 0.55 * smoothstep(-0.4, 0.6, mu);
   for (int o = 0; o < 3; o++) {
-    float beer = exp(-depth * SIGMA * b);
-    // Powder: light that scattered back out of a dense edge before it could be
-    // absorbed. It is the thing that makes a sunlit cumulus edge read as solid
-    // rather than translucent, and it must key off the LOCAL density, not the
-    // path integral, or it darkens the whole cloud instead of its rim.
-    float powder = 1.0 - exp(-selfDensity * 14.0);
-    float phase = dualHG(mu, 0.82 * c, -0.32 * c, 0.55);
-    lum += sunColor * a * phase * beer * mix(1.0, powder, 0.6);
-    // Successive octaves stand for light that has already bounced: each one is
-    // dimmer but penetrates much further, and it is that long tail that keeps
-    // the inside of a thick cell luminous grey instead of black. The tail has
-    // to keep decaying though — at b = 0.09 the third octave barely attenuates
-    // at all, so it acts as a second flat ambient and erases the very gradient
-    // between the lit shoulder and the shaded flank it exists to soften.
-    a *= 0.5; b *= 0.42; c *= 0.68;
+    float beer = exp(-od * b);
+    float phase = dualHG(mu, 0.80 * c, -0.28 * c, 0.5);
+    lum += sunColor * a * phase * beer * mix(1.0, powder, powderW);
+    a *= 0.55; b *= 0.45; c *= 0.6;
   }
   return lum;
 }
 
 /**
- * Two-speed raymarch: long cheap strides (no detail octave) hunt for the cloud
- * boundary, then we back up and integrate with short detailed steps. Leaving a
- * cell reverts to striding. This is what makes a 4 km deck affordable at
- * horizon distances where the ray can cover 200 km inside the shell.
- *
+ * Two-speed raymarch: cheap strides (no erosion) hunt for the boundary, then
+ * the ray backs up and integrates with short detailed steps.
  * @return vec4(scattered radiance, transmittance)
+ * diag = (transmittance-weighted depth, peak raw shape, peak density, taps in cloud)
  */
 vec4 marchClouds(vec3 ro, vec3 rd, float rayJitter, vec3 sunColor, out vec4 diag) {
-  // diag = (first-hit distance, peak raw shape, peak density, taps inside cloud)
   diag = vec4(-1.0, 0.0, 0.0, 0.0);
-  float depthOut = -1.0;
-  float peakDensity = 0.0;
   vec3 center = vec3(0.0, -PLANET_R, 0.0);
   vec3 o = ro - center;
 
@@ -402,74 +381,62 @@ vec4 marchClouds(vec3 ro, vec3 rd, float rayJitter, vec3 sunColor, out vec4 diag
   }
   if (t1 <= t0) return vec4(0.0, 0.0, 0.0, 1.0);
 
-  // Beyond this the deck is a few pixels tall on the horizon and the aerial
-  // perspective has already washed it into the haze, so marching further only
-  // buys banding.
-  float maxDist = 140000.0;
+  float maxDist = 90000.0;
   t1 = min(t1, t0 + maxDist);
-  float span = t1 - t0;
   gT0 = t0; gT1 = t1;
 
-  // Fine steps resolve the cell; they have to stay short enough that a single
-  // step cannot swallow the whole optical depth, or the visible skin of the
-  // cloud collapses to one flat sample. Tying this to the deck thickness would
-  // make a 12 km storm deck step in 250 m chunks, which is exactly the case
-  // where the skin matters most. Distance relaxes it because a far cell is a
-  // pixel wide anyway.
-  float nearFine = clamp(thickness * 0.005, 22.0, 48.0);
+  // Short enough that one step cannot swallow the optical depth of the ~20 m
+  // skin where all the visible shading happens.
+  float nearFine = clamp(thickness * 0.006, 16.0, 36.0);
 
   float mu = dot(rd, uSunDir);
   vec3 scatter = vec3(0.0);
   float transmittance = 1.0;
+  float depthAcc = 0.0;
+  float peakDensity = 0.0;
 
   float t = t0 + nearFine * rayJitter;
+  float tPrev = t;
   bool inside = false;
   int emptyRun = 0;
   int spent = 0;
 
-  for (int i = 0; i < 512; i++) {
+  for (int i = 0; i < 300; i++) {
     gIters = float(i);
-    if (spent >= uSteps || t > t1 || transmittance < 0.004) break;
-    // Sample spacing is a quality decision and must not be stretched to make
-    // the ray reach the far shell: a 500 m step swallows the whole optical
-    // depth of a storm cell in one go, which flattens its skin to a single
-    // sample and turns the ray-start jitter into salt-and-pepper noise.
-    // Instead the step only grows once the budget is nearly gone, smoothly,
-    // so a ray that runs long fades out rather than cutting off.
+    if (spent >= uSteps || t > t1 || transmittance < 0.005) break;
     float budget = float(uSteps - spent) / float(uSteps);
-    float fine = nearFine * clamp(1.0 + t / 9000.0, 1.0, 22.0)
-               * (1.0 + 7.0 * (1.0 - smoothstep(0.0, 0.35, budget)));
-    // The stride is what hunts for the cloud boundary, so it cannot be longer
-    // than the features it is hunting for: stride past a wisp and the ray
-    // reports empty, and whether it does depends on the jitter, which is
-    // precisely how a cloud edge turns into salt-and-pepper. Distance growth
-    // is compounding, so this still reaches 140 km in about 120 taps.
-    float stride = fine * 3.0;
+    // Distance relaxes the step because a far cell is a pixel wide; the budget
+    // relaxes it only near the end so a long ray fades rather than cuts off.
+    float fine = nearFine * clamp(1.0 + t / 7000.0, 1.0, 24.0)
+               * (1.0 + 6.0 * (1.0 - smoothstep(0.0, 0.3, budget)));
+    // The hunt stride is a fraction of the distance: at 30 km a 1 km stride is
+    // still under a pixel, and without it a horizon ray burns the whole loop
+    // walking 90 km of shell in cumulus-sized steps.
+    // ...but never longer than the smallest cell it is hunting for, or the
+    // jitter decides whether that cell exists and the deck turns to speckle.
+    float stride = min(max(fine * 2.5, t * 0.035), 110.0 + t * 0.012);
     vec3 p = o + rd * t;
     float h = clamp((length(p) - rInner) / thickness, 0.0, 1.0);
 
     if (!inside) {
+      // Empty column: the weather map says there is nothing here at any
+      // height, so leap. Footprints are hundreds of metres wide and fringed,
+      // so a 4x stride still lands inside the fringe before the core.
+      if (columnCoverage(p, h) <= 0.002) { tPrev = t; t += stride * 2.0; continue; }
       if (cloudDensity(p, h, 0.0) > 0.0) {
-        // Rewind to just before the boundary. The rewind lands on a grid that
-        // is nearly identical for neighbouring rays, so without re-jittering
-        // here the sample phase correlates across the screen and prints a comb
-        // of stripes across every cloud face. One fine step of jitter is enough
-        // to break that up; a whole stride just turns the comb into noise.
-        t = max(t - stride + fine * rayJitter, t0);
+        // The boundary lies between the last empty sample and this one:
+        // rewind to there, re-jittered by one fine step so neighbouring rays
+        // do not land on the same phase and print a comb.
+        t = max(tPrev + fine * rayJitter, t0);
         inside = true;
         emptyRun = 0;
       } else {
+        tPrev = t;
         t += stride;
       }
       continue;
     }
 
-    // Detail octaves retire when what they carve stops resolving. Retiring the
-    // fine octave at a kilometre and a bit — nearer than the cloud base itself
-    // — meant every cloud in the sky was drawn from the base shape alone, and a
-    // 128-cell volume stretched over seven kilometres holds nothing smaller
-    // than a three-hundred-metre blob. That, and not the march resolution, is
-    // what made the deck read as cotton wool.
     float detail = 2.0 - smoothstep(uDetailFade.x, uDetailFade.y, t)
                        - smoothstep(uDetailFade.y, uDetailFade.z, t);
     float dens = cloudDensity(p, h, detail);
@@ -478,46 +445,39 @@ vec4 marchClouds(vec3 ro, vec3 rd, float rayJitter, vec3 sunColor, out vec4 diag
     if (dens > 0.0005) {
       diag.w += 1.0;
       emptyRun = 0;
-      if (depthOut < 0.0) depthOut = t;
 
-      // Once the cloud in front has eaten most of the light, nothing behind it
-      // is resolvable, so the light march can drop to a couple of taps.
-      int ls = transmittance > 0.25 ? uLightSteps : 2;
-      vec3 lum = sampleLight(p, mu, sunColor, dens, rayJitter, ls);
-      // Ambient: sky from above, ocean-tinted bounce from below, attenuated by
-      // how deep inside the deck we are — that vertical gradient is what gives
-      // a cloud its dark base and bright shoulders.
-      // Skylight has to fight its way down through whatever cloud stands above
-      // this sample. Without this the ambient term is the same everywhere along
-      // the base and an overcast deck integrates to a flat grey sheet: the
-      // relief is all there in the geometry, but nothing shades it. Two coarse
-      // taps are enough, because what matters is the difference between a
-      // sample under two hundred metres of cloud and one under two kilometres.
+      int ls = transmittance > 0.3 ? uLightSteps : 2;
+      vec3 lum = sampleLight(p, mu, sunColor, rayJitter, ls);
+
+      // Skylight has to get down through whatever cloud stands above this
+      // sample: two coarse taps give the dark base / bright shoulder gradient.
       float above = 0.0;
       {
-        float span = max(uCloudTop - uCloudBottom, 200.0);
+        float span = max(thickness, 200.0);
         vec3 up = normalize(p);
-        above += cloudDensity(p + up * span * 0.10, min(h + 0.10, 1.0), 0.0) * span * 0.22;
-        above += cloudDensity(p + up * span * 0.34, min(h + 0.34, 1.0), 0.0) * span * 0.46;
+        above += cloudDensity(p + up * span * 0.08, min(h + 0.08, 1.0), 0.0) * span * 0.16;
+        above += cloudDensity(p + up * span * 0.30, min(h + 0.30, 1.0), 0.0) * span * 0.40;
       }
-      float skyVis = exp(-above * SIGMA * 0.55);
-
-      vec3 amb = mix(gAmbBottom, gAmbTop, h);
-      lum += amb * mix(0.55, 1.0, h) * mix(0.16, 1.0, skyVis);
+      float skyVis = mix(0.10, 1.0, exp(-above * SIGMA * 0.5));
+      vec3 amb = mix(gAmbBottom, gAmbTop, smoothstep(0.0, 1.0, h)) * skyVis * gAO;
+      lum += amb;
       lum += lightningGlow(p + center);
       lum += uAmbientFlash * uLightningColor * 0.25;
 
       float tr = exp(-dens * SIGMA * fine);
-      // analytic slab integration keeps banding away at low step counts
-      scatter += lum * transmittance * (1.0 - tr);
+      float w = transmittance * (1.0 - tr);
+      scatter += lum * w;
+      depthAcc += t * w;
       transmittance *= tr;
     } else if (++emptyRun > 4) {
       inside = false;
     }
+    tPrev = t;
     t += fine;
   }
 
-  diag.x = depthOut;
+  float opacity = 1.0 - transmittance;
+  diag.x = opacity > 0.002 ? depthAcc / opacity : -1.0;
   diag.y = gShapeR;
   diag.z = max(gBase, peakDensity);
   gSpent = float(spent);
@@ -525,25 +485,12 @@ vec4 marchClouds(vec3 ro, vec3 rd, float rayJitter, vec3 sunColor, out vec4 diag
 }
 `;
 
-/**
- * Marches 1/16 of the low-resolution rays per frame. Each fragment stands for
- * one low-res pixel inside a 4x4 block, chosen by a Bayer-ordered offset that
- * cycles over 16 frames; the resolve pass scatters the result back and
- * reprojects the other 15/16.
- */
+/** Marches every low-resolution pixel, jittered per frame. */
 const CLOUD_FRAG = /* glsl */ `
-precision highp float;
-precision highp int;
-precision highp sampler2D;
-precision highp sampler3D;
-
 uniform mat4 uInvViewProj;
 uniform vec3 uCamPos;
 uniform vec2 uLowRes;
-uniform vec2 uSlotOffset;
 uniform float uFrame;
-// Temporary instrument: writes a march internal instead of radiance so the
-// buffer can be blitted and read. 0 = off.
 uniform int uCloudDebug;
 
 ${ATMO_COMMON}
@@ -560,18 +507,16 @@ layout(location = 0) out vec4 oColor;
 layout(location = 1) out vec4 oDepth;
 
 void main(){
-  vec2 lowPix = floor(gl_FragCoord.xy) * 4.0 + uSlotOffset + 0.5;
-  vec2 uv = lowPix / uLowRes;
-
-  vec2 ndc = uv * 2.0 - 1.0;
+  vec2 ndc = vUv * 2.0 - 1.0;
   vec4 p0 = uInvViewProj * vec4(ndc, -1.0, 1.0); p0 /= p0.w;
   vec4 p1 = uInvViewProj * vec4(ndc,  1.0, 1.0); p1 /= p1.w;
   vec3 rd = normalize(p1.xyz - p0.xyz);
 
-  // Anything below the horizon is covered by the (spherical) ocean, so the
-  // cloud march there is pure waste — that is nearly half the frame.
+  // Below the horizon the ocean covers everything: nearly half the frame.
+  // Only valid while the camera is under the deck: from above, the clouds
+  // are between the eye and the sea.
   float dip = -sqrt(2.0 * max(uCamPos.y, 0.0) / 6360000.0) - 0.003;
-  if (rd.y < dip) {
+  if (rd.y < dip && uCamPos.y < uCloudBottom) {
     oColor = vec4(0.0, 0.0, 0.0, 1.0);
     oDepth = vec4(-1.0, 0.0, 0.0, 0.0);
     return;
@@ -582,62 +527,42 @@ void main(){
   skyAmbient(viewPos, rd);
 
   vec4 diag;
-  // Jitter is a pure function of the low-res pixel, deliberately not of time.
-  // Each pixel is re-marched on the same phase of the 4x4 amortisation cycle,
-  // so a fixed offset means every refresh returns the same radiance and the
-  // history can be replaced outright instead of crawling toward it. A temporal
-  // offset would decorrelate successive refreshes, force a slow blend, and the
-  // slow blend is exactly what drags the image back to the marched resolution
-  // and prints its blocks the moment the camera moves.
-  //
-  // Bayer rather than a hash: the resolve filter averages a 4x4 neighbourhood,
-  // and an ordered pattern guarantees those sixteen pixels carry the sixteen
-  // distinct offsets exactly once. That is a stratified estimate of the ray
-  // integral; white noise would leave clumps and gaps in the offsets and so a
-  // visibly grainier average for the same number of samples.
-  // Bayer stratifies the offsets across the sixteen pixels of a block, but its
-  // period is exactly the period of the amortisation, so on its own every pixel
-  // would be re-marched with the same offset forever and its sampling error
-  // would freeze into a static 4x4 pattern that no amount of resolve filtering
-  // removes. Rotating by the golden ratio once per refresh cycle keeps the
-  // spatial stratification and lets the history average the error away instead.
-  float cycle = floor(uFrame * 0.0625);
-  vec4 cl = marchClouds(uCamPos, rd, fract(bayer4(lowPix) + 0.6180339887 * cycle),
-                        sunColor, diag);
+  // Interleaved gradient noise, rotated every frame: neighbours decorrelate
+  // spatially and each pixel walks a different phase over time, so the
+  // temporal accumulation integrates a genuinely supersampled ray.
+  float jitter = ignTemporal(gl_FragCoord.xy, uFrame);
+  vec4 cl = marchClouds(uCamPos, rd, jitter, sunColor, diag);
 
   vec3 haze = getValFromSkyLUT(uSkyViewLUT, viewPos, rd, uSunDir) * uSunIntensity;
   cl.rgb = applyAerial(cl.rgb, cl.a, diag.x, haze);
 
   if (uCloudDebug > 0) {
-    // Three internals per pass so one capture answers three questions.
     vec3 v = (uCloudDebug == 1)
-      ? vec3(gT0 / 40000.0, gIters / 512.0, gCov)             // entry, budget, weather
-      : vec3(gSpent / float(uSteps), diag.z, diag.x / 60000.0); // steps, density, hit
+      ? vec3(gT0 / 40000.0, gIters / 300.0, gCov)
+      : vec3(gSpent / float(uSteps), diag.z, diag.x / 60000.0);
     oColor = vec4(clamp(v, 0.0, 1.0), 1.0);
     oDepth = diag;
     return;
   }
-
   oColor = cl;
   oDepth = diag;
 }
 `;
 
 /**
- * Scatters this frame's 1/16 slice back into the low-res buffer and fills the
- * rest by reprojecting the previous frame along the cloud-shell depth.
+ * Temporal accumulation. History is reprojected along this pixel's own cloud
+ * depth, clamped to the 3×3 neighbourhood of the fresh march, and blended.
  */
-const CLOUD_REPROJ_FRAG = /* glsl */ `
-precision highp float;
-precision highp int;
-uniform sampler2D uQuarter;      // freshly marched slice
-uniform sampler2D uQuarterDiag;
+const CLOUD_TEMPORAL_FRAG = /* glsl */ `
+uniform sampler2D uCur;
+uniform sampler2D uCurDiag;
 uniform sampler2D uHistory;
 uniform sampler2D uHistoryDiag;
 uniform mat4 uPrevViewProj;
 uniform mat4 uInvViewProj;
 uniform vec3 uCamPos;
-uniform vec2 uSlotOffset;
+uniform vec2 uInvRes;
+uniform vec2 uRes;
 uniform float uReset;
 uniform float uBlend;
 uniform float uShellMid;
@@ -645,106 +570,80 @@ in vec2 vUv;
 layout(location = 0) out vec4 oColor;
 layout(location = 1) out vec4 oDiag;
 
+// Catmull-Rom history fetch as nine bilinear taps collapsed to four: a plain
+// bilinear history read blurs a little more every frame and the deck turns to
+// fog under a slow pan.
+vec4 sampleHistory(vec2 uv) {
+  vec2 pos = uv * uRes - 0.5;
+  vec2 base = floor(pos);
+  vec2 f = pos - base;
+  vec2 f2 = f * f, f3 = f2 * f;
+  vec2 w0 = f2 - 0.5 * (f3 + f);
+  vec2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+  vec2 w3 = 0.5 * (f3 - f2);
+  vec2 w2 = 1.0 - w0 - w1 - w3;
+  vec2 s0 = w0 + w1, s1 = w2 + w3;
+  vec2 t0 = (base - 0.5 + w1 / s0) * uInvRes;
+  vec2 t1 = (base + 1.5 + w3 / s1) * uInvRes;
+  return texture(uHistory, vec2(t0.x, t0.y)) * (s0.x * s0.y)
+       + texture(uHistory, vec2(t1.x, t0.y)) * (s1.x * s0.y)
+       + texture(uHistory, vec2(t0.x, t1.y)) * (s0.x * s1.y)
+       + texture(uHistory, vec2(t1.x, t1.y)) * (s1.x * s1.y);
+}
+
 void main(){
   ivec2 lp = ivec2(gl_FragCoord.xy);
-  ivec2 qp = lp >> 2;
-  ivec2 slot = ivec2(uSlotOffset);
-  bool fresh = (lp.x & 3) == slot.x && (lp.y & 3) == slot.y;
+  vec4 cur = texelFetch(uCur, lp, 0);
+  vec4 curDiag = texelFetch(uCurDiag, lp, 0);
 
-  vec4 cur = texelFetch(uQuarter, qp, 0);
-  vec4 curDiag = texelFetch(uQuarterDiag, qp, 0);
+  if (uReset > 0.5) { oColor = cur; oDiag = curDiag; return; }
 
-  // Where there is no history to blend against, seed from a bilinear read of
-  // the marched buffer rather than the nearest texel: point-sampling it hands
-  // every pixel of a 4x4 amortisation cell the same value, so the sky prints as
-  // hard rectangles until all sixteen slots have been revisited. Soft and
-  // low-resolution converges to sharp; blocky reads as broken.
-  vec4 smooth_ = texture(uQuarter, vUv);
-  vec4 smoothDiag = texture(uQuarterDiag, vUv);
-
-  if (uReset > 0.5) {
-    oColor = fresh ? cur : smooth_;
-    oDiag = fresh ? curDiag : smoothDiag;
-    return;
-  }
-
-  // reproject using this pixel's own history depth; fall back to the shell mid
-  float dist = texture(uHistoryDiag, vUv).x;
-  if (dist <= 0.0) dist = uShellMid;
-
+  // Reproject along the cloud's own depth; where the ray found nothing the
+  // shell midpoint stands in, which is right for the sky behind a cell edge.
+  float dist = curDiag.x > 0.0 ? curDiag.x : uShellMid;
   vec2 ndc = vUv * 2.0 - 1.0;
   vec4 p0 = uInvViewProj * vec4(ndc, -1.0, 1.0); p0 /= p0.w;
   vec4 p1 = uInvViewProj * vec4(ndc,  1.0, 1.0); p1 /= p1.w;
   vec3 rd = normalize(p1.xyz - p0.xyz);
   vec4 prevClip = uPrevViewProj * vec4(uCamPos + rd * dist, 1.0);
-  vec2 prevUv = (prevClip.xy / max(prevClip.w, 1e-6)) * 0.5 + 0.5;
-
-  // Disoccluded at the edge the camera is panning into — same story as a reset.
+  if (prevClip.w <= 0.0) { oColor = cur; oDiag = curDiag; return; }
+  vec2 prevUv = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
   if (any(lessThan(prevUv, vec2(0.0))) || any(greaterThan(prevUv, vec2(1.0)))) {
-    oColor = fresh ? cur : smooth_;
-    oDiag = fresh ? curDiag : smoothDiag;
-    return;
+    oColor = cur; oDiag = curDiag; return;
   }
 
-  vec4 hist = texture(uHistory, prevUv);
+  vec4 hist = sampleHistory(prevUv);
   vec4 histDiag = texture(uHistoryDiag, prevUv);
 
-  // Reject stale history the same way TAA does: the 3x3 block of freshly
-  // marched samples around this pixel bounds what it can plausibly be. Without
-  // this, whole regions can hold onto pre-camera-cut content indefinitely.
+  // Neighbourhood clamp, loose enough not to fight the jitter's own variance.
   vec4 lo = cur, hi = cur;
-  ivec2 qmax = textureSize(uQuarter, 0) - 1;
+  ivec2 mx = ivec2(uRes) - 1;
   for (int y = -1; y <= 1; y++)
   for (int x = -1; x <= 1; x++) {
-    vec4 s = texelFetch(uQuarter, clamp(qp + ivec2(x, y), ivec2(0), qmax), 0);
+    vec4 s = texelFetch(uCur, clamp(lp + ivec2(x, y), ivec2(0), mx), 0);
     lo = min(lo, s); hi = max(hi, s);
   }
-  // Generous: this exists to catch history that survived a camera cut, not to
-  // police detail. Clamping tightly against a 4x-coarser neighbourhood drags
-  // every pixel back toward the marched resolution and prints its blocks.
-  vec4 tol = (hi - lo) * 1.5 + vec4(0.06, 0.06, 0.06, 0.12);
+  vec4 tol = (hi - lo) * 0.6 + vec4(0.015, 0.015, 0.015, 0.03);
   hist = clamp(hist, lo - tol, hi + tol);
 
-  if (fresh) {
-    oColor = mix(hist, cur, uBlend);
-    oDiag = curDiag;
-  } else {
-    oColor = hist;
-    oDiag = histDiag;
-  }
+  // A large depth disagreement means the history belonged to a different
+  // cloud (a cell edge slid across this pixel): trust the fresh sample more.
+  float dm = abs(histDiag.x - curDiag.x) / max(dist, 1.0);
+  float alpha = mix(uBlend, 1.0, smoothstep(0.25, 0.8, dm) * float(histDiag.x > 0.0 && curDiag.x > 0.0));
+
+  oColor = mix(hist, cur, alpha);
+  oDiag = mix(histDiag, curDiag, alpha);
 }
 `;
 
-/**
- * Upsample from the amortised low buffer to screen.
- *
- * The residual pattern in the low buffer has a period of exactly four texels:
- * the sixteen pixels of an amortisation block were marched on sixteen different
- * frames, so while the camera moves each carries a different reprojection error
- * and the block prints as a crosshatch. A four-texel box has a zero at exactly
- * that frequency and erases it — but four low-res texels are eight screen
- * pixels, so running that box unconditionally is why every cloud in the sky was
- * a blurred smudge with no silhouette at all.
- *
- * The block only prints while history is being dragged across the buffer. Hold
- * the camera still and every slot converges on the same ray, the low buffer
- * becomes exact, and there is nothing to hide. So the box fades in with camera
- * motion and the still frame gets a sharp cubic instead — which is the frame
- * anyone actually judges the sky on, and while swinging the camera the motion
- * blur covers what the box costs.
- */
+/** Catmull-Rom upsample from the low buffer to screen. */
 const CLOUD_UPSAMPLE_FRAG = /* glsl */ `
-precision highp float;
 uniform sampler2D uSrc;
 uniform vec2 uInvSrc;
 uniform vec2 uSrcRes;
-uniform float uSharpen;   // 0 = trust the low buffer, 1 = hide the block grid
 in vec2 vUv;
 layout(location = 0) out vec4 oColor;
 
-// Catmull-Rom over the nine nearest texels, gathered as four bilinear taps.
-// Straight bilinear magnification turns a half-resolution cumulus into a
-// lattice of diamonds; the cubic keeps an edge an edge.
 vec4 bicubic(vec2 uv) {
   vec2 pos = uv * uSrcRes - 0.5;
   vec2 base = floor(pos);
@@ -765,30 +664,12 @@ vec4 bicubic(vec2 uv) {
 
 void main(){
   vec4 c = bicubic(vUv);
-  if (uSharpen > 0.002) {
-    // Snap to the nearest texel corner first. A bilinear tap sitting exactly on
-    // a corner is the average of the four texels around it, so four such taps
-    // one texel out on each diagonal are an exact 4x4 box. Left unsnapped they
-    // land mid-texel, the box stops being a box, and the cancellation is only
-    // partial.
-    vec2 corner = (floor(vUv / uInvSrc - 0.5) + 1.0) * uInvSrc;
-    vec4 wide = texture(uSrc, corner + vec2(-1.0, -1.0) * uInvSrc)
-              + texture(uSrc, corner + vec2( 1.0, -1.0) * uInvSrc)
-              + texture(uSrc, corner + vec2(-1.0,  1.0) * uInvSrc)
-              + texture(uSrc, corner + vec2( 1.0,  1.0) * uInvSrc);
-    c = mix(c, wide * 0.25, uSharpen);
-  }
   c.a = clamp(c.a, 0.0, 1.0);
   oColor = max(c, vec4(0.0));
 }
 `;
 
 const CLOUD_ENV_FRAG = /* glsl */ `
-precision highp float;
-precision highp int;
-precision highp sampler2D;
-precision highp sampler3D;
-
 uniform vec3 uCamPos;
 uniform float uFrame;
 
@@ -820,6 +701,42 @@ void main(){
 }
 `;
 
+/**
+ * With the eye above the cloud base the deck sits between it and the sea, and
+ * the ocean mesh paints over the layer the sky pass composited. This
+ * full-screen triangle re-applies the layer after the ocean, premultiplied
+ * (dst * a + rgb), on rays that hit the sea. Sky rays already carry it.
+ */
+const OVER_VERT = /* glsl */ `
+precision highp float;
+in vec3 position;
+in vec2 uv;
+out vec2 vUv;
+void main(){ vUv = uv; gl_Position = vec4(position.xy, 1.0, 1.0); }
+`;
+const OVER_FRAG = /* glsl */ `
+precision highp float;
+uniform sampler2D uCloudTex;
+uniform mat4 uInvViewProj;
+uniform vec3 uCamPos;
+in vec2 vUv;
+layout(location = 0) out vec4 oColor;
+layout(location = 1) out vec4 oVelocity;
+void main(){
+  vec2 ndc = vUv * 2.0 - 1.0;
+  vec4 p0 = uInvViewProj * vec4(ndc, -1.0, 1.0); p0 /= p0.w;
+  vec4 p1 = uInvViewProj * vec4(ndc,  1.0, 1.0); p1 /= p1.w;
+  vec3 rd = normalize(p1.xyz - p0.xyz);
+  // same horizon test the marcher uses: below it the ray meets the sea
+  float dip = -sqrt(2.0 * max(uCamPos.y, 0.0) / 6360000.0) - 0.003;
+  if (rd.y >= dip) discard;
+  vec4 cl = texture(uCloudTex, vUv);
+  oColor = vec4(max(cl.rgb, vec3(0.0)), clamp(cl.a, 0.0, 1.0));
+  // ONE / SRC_ALPHA blending leaves the velocity buffer untouched
+  oVelocity = vec4(0.0, 0.0, 0.0, 1.0);
+}
+`;
+
 export class Clouds {
   constructor(renderer, atmosphere, textures, quality) {
     this.renderer = renderer;
@@ -836,26 +753,33 @@ export class Clouds {
     };
     const [shapeLo, shapeHi] = pct(textures.cloudShape);
     const [detLo, detHi] = pct(textures.cloudDetail);
+    const [wLo, wHi] = pct(textures.weather);
 
     this.shared = {
       uCloudShape: { value: textures.cloudShape },
       uCloudDetail: { value: textures.cloudDetail },
       uShapeLo: { value: shapeLo }, uShapeHi: { value: shapeHi },
       uDetailLo: { value: detLo }, uDetailHi: { value: detHi },
+      uWeatherLo: { value: wLo }, uWeatherHi: { value: wHi },
       uCurlTex: U.uCurlTex,
       uWeatherMap: { value: textures.weather },
-      uWeatherScaleM: { value: 58000 },
+      uWeatherScaleM: { value: 56000 },
       uCoverage: { value: 0.4 },
       uCloudDensity: { value: 0.6 },
       uCloudBottom: { value: 1200 },
       uCloudTop: { value: 5200 },
       uAnvil: { value: 0.0 },
-      uStorm: U.uStormFactor,
       uCloudWind: { value: new THREE.Vector2(6, 2) },
       uCloudTime: { value: 0 },
-      uCloudScaleM: { value: 15000 },
-      uCloudAspect: { value: 2.6 },
-      uCloudContrast: { value: 1.6 },
+      // A billow is a few hundred metres across; the shape volume repeats
+      // every 6 km so its lowest worley octave is ~1.5 km and its voxels ~47 m.
+      uCloudScaleM: { value: 6000 },
+      uDetailScaleM: { value: 700 },
+      // kept for callers that still poke it; no longer read by the shaders
+      uCloudContrast: { value: 1.0 },
+      // screen-space layer + "eye is above the base" flag, read by the ocean
+      uCloudTex: { value: null },
+      uCloudOver: { value: 0 },
       uSunIntensity: U.uSunIntensity,
       uSunDir: U.uSunDir,
       uSkyAmbLUT: { value: atmosphere.skyViewRT.texture },
@@ -872,41 +796,33 @@ export class Clouds {
       uLightSteps: { value: 6 },
     };
 
-    // Bayer-ordered visiting order for the 4x4 amortisation grid: consecutive
-    // frames land far apart, so a partially converged buffer looks uniform.
-    const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
-    this.slots = new Array(16);
-    for (let i = 0; i < 16; i++) this.slots[BAYER[i]] = [i % 4, (i / 4) | 0];
-
     this.marchPass = new FullScreenPass(CLOUD_FRAG, {
       ...this.shared,
       uInvViewProj: U.uInvViewProjNJ,
       uCamPos: U.uCamPos,
       uLowRes: { value: new THREE.Vector2(1, 1) },
-      uSlotOffset: { value: new THREE.Vector2() },
       uFrame: U.uFrame,
-      uDetailFade: { value: new THREE.Vector3(9000, 34000, 95000) },
+      // Each erosion octave retires where its features fall under ~2 pixels;
+      // past that it only adds sub-pixel aliasing the temporal pass then has
+      // to average away as grain.
+      uDetailFade: { value: new THREE.Vector3(2500, 9000, 30000) },
       uCloudDebug: { value: 0 },
     }, { name: 'cloudMarch' });
 
-    this.reprojPass = new FullScreenPass(CLOUD_REPROJ_FRAG, {
-      uQuarter: { value: null }, uQuarterDiag: { value: null },
+    this.temporalPass = new FullScreenPass(CLOUD_TEMPORAL_FRAG, {
+      uCur: { value: null }, uCurDiag: { value: null },
       uHistory: { value: null }, uHistoryDiag: { value: null },
       uPrevViewProj: U.uPrevViewProjNJ, uInvViewProj: U.uInvViewProjNJ,
-      uCamPos: U.uCamPos, uSlotOffset: { value: new THREE.Vector2() },
-      // A refreshed sample is one estimate of the ray integral, not the answer,
-      // because the march offset now changes every cycle. Blending rather than
-      // replacing is what turns those estimates into an average.
-      uReset: { value: 1 }, uBlend: { value: 0.4 },
+      uCamPos: U.uCamPos,
+      uInvRes: { value: new THREE.Vector2() }, uRes: { value: new THREE.Vector2() },
+      uReset: { value: 1 }, uBlend: { value: 0.08 },
       uShellMid: { value: 20000 },
-    }, { name: 'cloudReproj' });
+    }, { name: 'cloudTemporal' });
 
     this.upsamplePass = new FullScreenPass(CLOUD_UPSAMPLE_FRAG, {
       uSrc: { value: null }, uInvSrc: { value: new THREE.Vector2() },
       uSrcRes: { value: new THREE.Vector2() },
-      uSharpen: { value: 0.0 },
     }, { name: 'cloudUpsample' });
-    this._blockHide = 0;
 
     this.envPass = new FullScreenPass(CLOUD_ENV_FRAG, {
       ...this.shared,
@@ -914,9 +830,26 @@ export class Clouds {
       uFrame: U.uFrame,
       uSteps: { value: 18 },
       uLightSteps: { value: 3 },
-      // The probe feeds reflections, which never resolve an erosion octave.
       uDetailFade: { value: new THREE.Vector3(1500, 4000, 12000) },
     }, { name: 'cloudEnv' });
+
+    const overGeom = new THREE.BufferGeometry();
+    overGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3));
+    overGeom.setAttribute('uv', new THREE.BufferAttribute(new Float32Array([0, 0, 2, 0, 0, 2]), 2));
+    overGeom.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 4);
+    this.overMaterial = new THREE.RawShaderMaterial({
+      name: 'CloudOverOcean', glslVersion: THREE.GLSL3,
+      vertexShader: OVER_VERT, fragmentShader: OVER_FRAG,
+      uniforms: { uCloudTex: this.shared.uCloudTex, uInvViewProj: U.uInvViewProjNJ, uCamPos: U.uCamPos },
+      depthTest: false, depthWrite: false, transparent: true,
+      blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+      blendSrc: THREE.OneFactor, blendDst: THREE.SrcAlphaFactor,
+      blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor,
+    });
+    this.overMesh = new THREE.Mesh(overGeom, this.overMaterial);
+    this.overMesh.frustumCulled = false;
+    this.overMesh.renderOrder = 4;   // after the ocean (0), before spout (5) and particles
+    this.overMesh.visible = false;
 
     this.setQuality(quality);
   }
@@ -943,36 +876,27 @@ export class Clouds {
   }
 
   setSize(w, h, force = false) {
-    // the low buffer must be a multiple of 4 so the amortisation grid tiles
-    const lw = Math.max(16, Math.ceil(w * this.scale / 4) * 4);
-    const lh = Math.max(16, Math.ceil(h * this.scale / 4) * 4);
+    const lw = Math.max(16, Math.round(w * this.scale));
+    const lh = Math.max(16, Math.round(h * this.scale));
     if (!force && this.lowW === lw && this.lowH === lh) return;
     this.fullW = w; this.fullH = h;
     this.lowW = lw; this.lowH = lh;
 
-    this.quarterRT?.dispose();
+    this.curRT?.dispose();
     this.history?.dispose();
     this.fullRT?.dispose();
 
-    // linear filtered so the reprojection can also read it as a smooth
-    // low-frequency estimate; the per-slot reads use texelFetch regardless
-    this.quarterRT = makeRT(lw / 4, lh / 4, {
-      type: THREE.HalfFloatType, count: 2, name: 'cloudQuarter',
-      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
-    });
+    this.curRT = makeRT(lw, lh, { type: THREE.HalfFloatType, count: 2, name: 'cloudCur' });
     this.history = new PingPong(lw, lh, { type: THREE.HalfFloatType, count: 2, name: 'cloudHist' });
     this.fullRT = makeRT(w, h, { type: THREE.HalfFloatType, name: 'cloudFull' });
+    this.shared.uCloudTex.value = this.fullRT.texture;
     this.marchPass.uniforms.uLowRes.value.set(lw, lh);
+    this.temporalPass.uniforms.uRes.value.set(lw, lh);
+    this.temporalPass.uniforms.uInvRes.value.set(1 / lw, 1 / lh);
     this.reset = true;
   }
 
-  /**
-   * Worst-case distance, in low-resolution texels, that the resolve has to drag
-   * history to line it up with this frame — sampled at the screen centre and
-   * the four corners so both translation and rotation are caught. Zero means
-   * every amortisation slot is looking down the same ray it looked down last
-   * frame, so the low buffer is converged and can be trusted sharp.
-   */
+  /** Worst-case reprojection shift in low-res texels; used for the HUD only. */
   _reprojectionShift(dist) {
     const inv = U.uInvViewProjNJ.value;
     const prev = U.uPrevViewProjNJ.value;
@@ -982,8 +906,6 @@ export class Clouds {
       _pa.set(p[0], p[1], -1).applyMatrix4(inv);
       _pb.set(p[0], p[1], 1).applyMatrix4(inv);
       _pb.sub(_pa).normalize().multiplyScalar(dist).add(cam).applyMatrix4(prev);
-      // Off the back of the previous frustum the projection flips; treat that
-      // as a full disocclusion rather than reading a mirrored coordinate.
       if (!Number.isFinite(_pb.x) || !Number.isFinite(_pb.y)) return 1e3;
       const du = (_pb.x - p[0]) * 0.5 * this.lowW;
       const dv = (_pb.y - p[1]) * 0.5 * this.lowH;
@@ -998,52 +920,29 @@ export class Clouds {
     const r = this.renderer;
     const s = this.shared;
     s.uCloudTime.value = time;
-
-    // A billow is about as tall as it is wide — that is what makes a cumulus a
-    // cumulus. Squashing the volume to fit one billow per deck made every cell
-    // three times wider than tall, and fair-weather cloud came out as floating
-    // pancakes. Shaping the deck vertically is heightProfile's job; the noise
-    // should stay close to isotropic and only stretch for a deep storm tower.
-    const thickness = Math.max(s.uCloudTop.value - s.uCloudBottom.value, 200);
-    s.uCloudAspect.value = THREE.MathUtils.clamp(
-      s.uCloudScaleM.value / (thickness * 4.4), 0.8, 1.7);
-
-    const slot = this.slots[this.frame % 16];
-    this.marchPass.uniforms.uSlotOffset.value.set(slot[0], slot[1]);
-    this.reprojPass.uniforms.uSlotOffset.value.set(slot[0], slot[1]);
+    s.uCloudOver.value = (U.uCamPos.value.y > s.uCloudBottom.value) ? 1 : 0;
+    this.overMesh.visible = s.uCloudOver.value === 1;
     this.frame++;
 
-    this.marchPass.render(r, this.quarterRT);
+    this.marchPass.render(r, this.curRT);
 
     const mid = (s.uCloudBottom.value + s.uCloudTop.value) * 0.5;
-    this.reprojPass
-      .set('uQuarter', this.quarterRT.textures[0])
-      .set('uQuarterDiag', this.quarterRT.textures[1])
+    this.temporalPass
+      .set('uCur', this.curRT.textures[0])
+      .set('uCurDiag', this.curRT.textures[1])
       .set('uHistory', this.history.read.textures[0])
       .set('uHistoryDiag', this.history.read.textures[1])
       .set('uReset', (this.reset || this.forceReset) ? 1 : 0)
       .set('uShellMid', Math.max(mid, 500) * 6.0);
-    this.reprojPass.render(r, this.history.write);
+    this.temporalPass.render(r, this.history.write);
     this.history.swap();
 
-    // How hard the resolve has to work to hide the amortisation grid, which is
-    // entirely a function of how far history is being dragged this frame.
-    // Engage fast, because the block prints on the frame the camera starts
-    // moving; release slowly, because all sixteen slots have to be revisited
-    // before the buffer is trustworthy again and that takes a third of a second.
-    const shift = this._reprojectionShift(Math.max(mid, 500) * 6.0);
-    const want = THREE.MathUtils.clamp((shift - 0.3) / 1.8, 0, 1);
-    this._blockHide += (want - this._blockHide) * (want > this._blockHide ? 0.55 : 0.045);
-
     this.upsamplePass.set('uSrc', this.history.read.textures[0]);
-    this.upsamplePass.set('uSharpen', this._blockHide * 0.85);
     this.upsamplePass.uniforms.uInvSrc.value.set(1 / this.lowW, 1 / this.lowH);
     this.upsamplePass.uniforms.uSrcRes.value.set(this.lowW, this.lowH);
     this.upsamplePass.render(r, this.fullRT);
 
-    // env probe refreshes on a slower cadence — reflections tolerate the lag
     if (this.frame % 8 === 0 || this.reset) this.envPass.render(r, this.envRT);
-
     this.reset = false;
   }
 
@@ -1051,7 +950,7 @@ export class Clouds {
   get envTexture() { return this.enabled ? this.envRT.texture : null; }
 
   dispose() {
-    this.quarterRT?.dispose(); this.history?.dispose();
+    this.curRT?.dispose(); this.history?.dispose();
     this.fullRT?.dispose(); this.envRT?.dispose();
   }
 }

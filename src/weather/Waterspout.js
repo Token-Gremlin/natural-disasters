@@ -367,6 +367,12 @@ export class Waterspout {
     this.maxLife = 34;
   }
 
+  /** Called every frame by the director as the vortex drifts downwind. */
+  setPosition(x, z) {
+    this.x = x;
+    this.z = z;
+  }
+
   clear() {
     this.active = false;
     this.mesh.visible = false;

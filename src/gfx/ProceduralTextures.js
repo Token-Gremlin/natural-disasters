@@ -121,16 +121,20 @@ void main(){
 `;
 
 /**
- * Cloud weather map. Deciding where cloud goes from a couple of taps into the
- * 3D shape volume looks fine in isolation but stamps the volume's texel grid
- * across the sky the moment you threshold it, because a 128³ trilinear field
- * is only C0 continuous. Baking the decision into a dedicated high-resolution
- * 2D field costs one fetch instead of two and has no grid to show.
+ * Cloud weather map. This is where cloud *is*: the 3D volumes only carve
+ * billows inside a footprint drawn here. It is baked at 1024² over ~40 km, so
+ * a cell outline is resolved at ~40 m — far finer than any 3D volume the
+ * marcher could afford — and the outline is a warped worley, which is what a
+ * cumulus field looks like from above: discrete rounded cells with ragged
+ * edges, clustered into systems with clear lanes between them.
  *
- *   r  synoptic coverage — the scale of whole weather systems
- *   g  cell modulation — which parts of a system are actively building
- *   b  cloud type — flat stratus through to a towering cumulonimbus
- *   a  convective cores, used to place the anvils
+ *   r  cumulus footprint field — thresholded by coverage in the shader
+ *   g  synoptic organisation — systems and clear lanes; also cloud type
+ *   b  large-cell field only — drives cell height
+ *   a  convective cores — sparse, inside deep systems; place the anvils
+ *
+ * The consumer normalises r onto its 2..98 percentiles so a coverage of 0.4
+ * really covers about 40% of the sky.
  */
 const WEATHER_FRAG = /* glsl */ `
 ${NOISE_GLSL}
@@ -140,30 +144,32 @@ layout(location = 0) out vec4 oCol;
 void main(){
   vec2 p = vUv;
 
-  // Synoptic scale: broad fronts and clear lanes. Ridged noise gives the long
-  // filamentary bands a satellite image actually shows, rather than the
-  // isotropic blobs a plain fbm produces. The ridge is smoothed because a bare
-  // absolute value has a crease along its zero set, and a crease in coverage
-  // becomes a dead-straight edge to the cloud deck kilometres long.
-  float f1 = fbm2Tiled(p, 4.0, 5);
-  float f2 = fbm2Tiled(p + vec2(3.7, 1.3), 6.0, 5);
-  float r = f2 * 2.0 - 1.0;
-  float band = 1.0 - sqrt(r * r + 0.035);
-  float synoptic = clamp(f1 * 0.62 + band * 0.55 - 0.10, 0.0, 1.0);
+  // Synoptic scale: fronts and clear lanes. Ridged noise gives the long
+  // filamentary bands a satellite image shows; the ridge is smoothed because a
+  // bare |x| has a crease that becomes a dead-straight deck edge.
+  float f1 = fbm2Seamless(p, 3.0, 5);
+  float r = fbm2Seamless(p + vec2(3.7, 1.3), 4.0, 5) * 2.0 - 1.0;
+  float band = 1.0 - sqrt(r * r + 0.04);
+  float synoptic = clamp((f1 - 0.5) * 2.2 + band * 0.9 - 0.12, 0.0, 1.0);
 
-  // Mesoscale cells inside a system, with worley to give them discrete edges.
-  float cells = 1.0 - worley2Tiled(p + vec2(0.41, 0.77), 9.0);
-  float meso = clamp(fbm2Tiled(p * 1.0 + vec2(9.1, 4.4), 11.0, 4) * 0.7 + cells * 0.5, 0.0, 1.0);
+  // Cumulus footprints: three octaves of inverted worley, domain-warped so no
+  // cell is a clean circle, plus fbm for the ragged fringe.
+  vec2 warp = vec2(fbm2Seamless(p + vec2(1.7, 9.2), 14.0, 3),
+                   fbm2Seamless(p + vec2(8.3, 2.8), 14.0, 3)) - 0.5;
+  vec2 wp = p + warp * 0.06;
+  float cA = 1.0 - worley2Tiled(wp, 19.0);
+  float cB = 1.0 - worley2Tiled(wp + vec2(0.31, 0.57), 41.0);
+  float cC = 1.0 - worley2Tiled(wp + vec2(0.77, 0.13), 83.0);
+  float cells = cA * 0.60 + cB * 0.28 + cC * 0.12;
+  float ragged = fbm2Seamless(p + vec2(4.4, 6.1), 90.0, 4);
+  float footprint = cells * 0.72 + ragged * 0.28;
 
-  // Type: the deepest, most persistent parts of a system grow towers.
-  float type = clamp(smoothstep(0.42, 0.86, synoptic) * 0.8
-                   + fbm2Tiled(p + vec2(6.3, 2.9), 7.0, 3) * 0.5, 0.0, 1.0);
+  float core = smoothstep(0.30, 0.80, cA) * smoothstep(0.4, 0.8, synoptic);
 
-  // Convective cores: sparse, small, and only inside an active region.
-  float core = smoothstep(0.55, 0.95, 1.0 - worley2Tiled(p + vec2(2.2, 8.8), 14.0));
-  core *= smoothstep(0.35, 0.8, synoptic);
-
-  oCol = vec4(synoptic, meso, type, core);
+  // Channels are kept separate so the shader can decide how much the
+  // synoptic lanes matter: a broken sky has clear lanes, an overcast one has
+  // none, and baking the product in made the lanes permanent holes.
+  oCol = vec4(footprint, synoptic, cA, core);
 }
 `;
 
@@ -198,37 +204,51 @@ function bake(renderer, frag, w, h, uniforms = {}, type = THREE.UnsignedByteType
  * to tune, so the consumer normalises with these instead of magic numbers.
  */
 function channelPercentiles(buf, count, p = 0.02) {
+  // Works on Uint8 (0..255) and Float32 (0..1) buffers alike.
+  const isFloat = buf instanceof Float32Array;
+  const BINS = isFloat ? 1024 : 256;
   const lo = [], hi = [];
   for (let c = 0; c < 4; c++) {
-    const hist = new Uint32Array(256);
-    for (let i = 0; i < count; i++) hist[buf[i * 4 + c]]++;
-    let acc = 0, l = 0, hgh = 255;
-    for (let i = 0; i < 256; i++) { acc += hist[i]; if (acc >= count * p) { l = i; break; } }
+    const hist = new Uint32Array(BINS);
+    for (let i = 0; i < count; i++) {
+      const v = buf[i * 4 + c];
+      const b = isFloat ? Math.min(BINS - 1, Math.max(0, (v * (BINS - 1)) | 0)) : v;
+      hist[b]++;
+    }
+    let acc = 0, l = 0, hgh = BINS - 1;
+    for (let i = 0; i < BINS; i++) { acc += hist[i]; if (acc >= count * p) { l = i; break; } }
     acc = 0;
-    for (let i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= count * p) { hgh = i; break; } }
-    if (hgh <= l) hgh = Math.min(255, l + 1);
-    lo.push(l / 255); hi.push(hgh / 255);
+    for (let i = BINS - 1; i >= 0; i--) { acc += hist[i]; if (acc >= count * p) { hgh = i; break; } }
+    if (hgh <= l) hgh = Math.min(BINS - 1, l + 1);
+    lo.push(l / (BINS - 1)); hi.push(hgh / (BINS - 1));
   }
   return { lo, hi };
 }
 
+/**
+ * The volumes are kept in float. Eight bits is only 256 levels, and a
+ * coverage threshold swept through a smooth field quantised that coarsely
+ * prints every level as a contour line — the "topographic terraces" that
+ * used to cover every large cloud face.
+ */
 function atlasTo3D(renderer, rt, res, tilesX, tilesY) {
   const w = res * tilesX, h = res * tilesY;
-  const buf = new Uint8Array(w * h * 4);
+  const buf = new Float32Array(w * h * 4);
   renderer.readRenderTargetPixels(rt, 0, 0, w, h, buf);
   const stats = channelPercentiles(buf, w * h);
-  const out = new Uint8Array(res * res * res * 4);
+  // Half float on the GPU: 16 bits is plenty of levels and half the bandwidth.
+  const out = new Uint16Array(res * res * res * 4);
   for (let z = 0; z < res; z++) {
     const tx = z % tilesX, ty = Math.floor(z / tilesX);
     for (let y = 0; y < res; y++) {
       const srcRow = ((ty * res + y) * w + tx * res) * 4;
       const dstRow = ((z * res + y) * res) * 4;
-      out.set(buf.subarray(srcRow, srcRow + res * 4), dstRow);
+      for (let k = 0; k < res * 4; k++) out[dstRow + k] = THREE.DataUtils.toHalfFloat(buf[srcRow + k]);
     }
   }
   const tex = new THREE.Data3DTexture(out, res, res, res);
   tex.format = THREE.RGBAFormat;
-  tex.type = THREE.UnsignedByteType;
+  tex.type = THREE.HalfFloatType;
   tex.minFilter = THREE.LinearFilter;
   tex.magFilter = THREE.LinearFilter;
   tex.wrapS = tex.wrapT = tex.wrapR = THREE.RepeatWrapping;
@@ -278,11 +298,18 @@ export async function bakeProceduralTextures(renderer, onProgress = () => {}) {
 
   onProgress('baking synoptic weather map');
   await yieldFrame();
-  const weatherRT = bake(renderer, WEATHER_FRAG, 1024, 1024);
+  // Float, not bytes: the coverage threshold sweeps through this field and an
+  // 8-bit staircase prints as contour terraces across every cloud face.
+  const weatherRT = bake(renderer, WEATHER_FRAG, 1024, 1024, {}, THREE.FloatType);
   weatherRT.texture.wrapS = weatherRT.texture.wrapT = THREE.RepeatWrapping;
-  weatherRT.texture.minFilter = THREE.LinearMipmapLinearFilter;
-  weatherRT.texture.generateMipmaps = true;
+  weatherRT.texture.minFilter = THREE.LinearFilter;
+  weatherRT.texture.magFilter = THREE.LinearFilter;
   weatherRT.texture.needsUpdate = true;
+  {
+    const buf = new Float32Array(1024 * 1024 * 4);
+    renderer.readRenderTargetPixels(weatherRT, 0, 0, 1024, 1024, buf);
+    weatherRT.texture.userData.percentiles = channelPercentiles(buf, 1024 * 1024);
+  }
   out.weather = weatherRT.texture;
   out._weatherRT = weatherRT;
 
@@ -291,7 +318,7 @@ export async function bakeProceduralTextures(renderer, onProgress = () => {}) {
   const SHAPE_RES = 128, SHAPE_TX = 16, SHAPE_TY = 8;
   const shapeRT = bake(renderer, CLOUD_SHAPE_FRAG, SHAPE_RES * SHAPE_TX, SHAPE_RES * SHAPE_TY, {
     uRes: { value: SHAPE_RES }, uTilesX: { value: SHAPE_TX },
-  });
+  }, THREE.FloatType);
   out.cloudShape = atlasTo3D(renderer, shapeRT, SHAPE_RES, SHAPE_TX, SHAPE_TY);
   shapeRT.dispose();
 
@@ -300,7 +327,7 @@ export async function bakeProceduralTextures(renderer, onProgress = () => {}) {
   const DET_RES = 32, DET_TX = 8, DET_TY = 4;
   const detRT = bake(renderer, CLOUD_DETAIL_FRAG, DET_RES * DET_TX, DET_RES * DET_TY, {
     uRes: { value: DET_RES }, uTilesX: { value: DET_TX },
-  });
+  }, THREE.FloatType);
   out.cloudDetail = atlasTo3D(renderer, detRT, DET_RES, DET_TX, DET_TY);
   detRT.dispose();
 

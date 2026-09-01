@@ -366,8 +366,6 @@ class Cascade {
     const fOpts = { type: THREE.FloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter };
     this.h0 = makeRT(N, N, { ...fOpts, name: 'h0' });
     this.h0k = makeRT(N, N, { ...fOpts, name: 'h0k' });
-    this.pp0 = new PingPong(N, N, { ...fOpts, name: 'fft0' });
-    this.pp1 = new PingPong(N, N, { ...fOpts, name: 'fft1' });
     // MRT pair used by the butterfly (two targets bound at once)
     this.mrtA = makeRT(N, N, { ...fOpts, name: 'mrtA', count: 2 });
     this.mrtB = makeRT(N, N, { ...fOpts, name: 'mrtB', count: 2 });
@@ -493,7 +491,6 @@ class Cascade {
 
   dispose() {
     [this.h0, this.h0k, this.mrtA, this.mrtB, this.out, this.turbPrev].forEach(t => t.dispose());
-    this.pp0.dispose(); this.pp1.dispose();
     [this.spectrumPass, this.conjPass, this.timePass, this.butterflyPass, this.assemblePass, this.copyTurb]
       .forEach(p => p.dispose());
   }
@@ -530,8 +527,11 @@ export class OceanFFT {
     const b2 = 2.0 * Math.PI / this.lengthScales[2] * 4.0;
     const bounds = [[1e-4, b1], [b1, b2], [b2, 9999.0]];
 
+    this._bounds = bounds;
     this.cascades = this.lengthScales.map((L, i) =>
       new Cascade(renderer, this.N, L, bounds[i][0], bounds[i][1], this.noise, this.butterfly));
+    // Every uniform block handed out by bind(), so a resize can repoint them.
+    this._bound = new Set();
 
     // wave state (driven by WeatherSystem)
     this.params = {
@@ -559,6 +559,36 @@ export class OceanFFT {
   }
 
   markDirty() { this._dirty = true; }
+
+  /**
+   * Rebuild the cascades at a new texel count. Materials that took their
+   * textures through bind() are repointed in place, so a preset change can
+   * grow or shrink the FFT without anyone recompiling.
+   */
+  resize(N) {
+    N = N | 0;
+    if (!N || N === this.N) return false;
+    this.cascades.forEach(c => c.dispose());
+    this.noise.dispose();
+    this.butterfly.dispose();
+    this.N = N;
+    this.noise = gaussianNoiseTexture(N, 0xC0FFEE);
+    this.butterfly = butterflyTexture(N);
+    this.cascades = this.lengthScales.map((L, i) =>
+      new Cascade(this.renderer, N, L, this._bounds[i][0], this._bounds[i][1], this.noise, this.butterfly));
+    this._dirty = true;
+    for (const u of this._bound) this._refresh(u);
+    return true;
+  }
+
+  _refresh(uniforms) {
+    for (let i = 0; i < 3; i++) {
+      uniforms[`uOceanDisp${i}`].value = this.cascades[i].displacement;
+      uniforms[`uOceanDeriv${i}`].value = this.cascades[i].derivatives;
+      uniforms[`uOceanTurb${i}`].value = this.cascades[i].turbulence;
+    }
+    uniforms.uOceanTexels.value = this.N;
+  }
 
   /** Significant wave height, integrated from the actual spectrum. */
   get significantWaveHeight() { return this.hs || 0; }
@@ -666,6 +696,7 @@ export class OceanFFT {
     uniforms.uOceanScales = { value: new THREE.Vector3(...this.lengthScales) };
     uniforms.uOceanTexels = { value: this.N };
     uniforms.uOceanAniso = { value: this.anisotropy };
+    this._bound.add(uniforms);
     return uniforms;
   }
 

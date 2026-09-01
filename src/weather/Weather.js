@@ -185,8 +185,6 @@ export class Weather {
       const cloudAngle = s.windAngle + 0.35;
       const cloudSpeed = 2.5 + ws * 0.42;
       cu.uCloudWind.value.set(Math.cos(cloudAngle) * cloudSpeed, Math.sin(cloudAngle) * cloudSpeed);
-      // fair-weather cumulus are ~1 km cells; storm cells are far bigger
-      cu.uCloudScaleM.value = lerp(7000, 20000, THREE.MathUtils.clamp(s.storm, 0, 1));
     }
 
     this.beaufort = beaufort(wsGust);
